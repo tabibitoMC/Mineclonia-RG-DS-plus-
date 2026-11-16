@@ -13,11 +13,15 @@ El diff completo está en `patches/rgds-plus-luanti-5.18.0.patch`.
 - **Pantalla inferior en el juego:** barra de objetos táctil, coordenadas, zona tipo
   touchpad para la cámara y botones de inventario, cámara y pausa. La barra de objetos
   ya no se dibuja arriba.
+- **Vida, comida y experiencia:** al no estar la barra de objetos arriba, estas barras
+  pasan al borde superior de la pantalla de arriba.
 - **Táctil:** lectura directa del panel (evdev) y activación del panel, que el menú de la
   consola apaga al abrir programas externos.
 - **Mando:** navegación de menús con cruceta/stick, A y B; L1/R1 cambian de pestaña.
 - **Menú principal:** pantalla de título arriba y menú abajo; tema de botones y fondo.
-- **Memoria:** tope al tamaño de las fuentes (una fuente de 190 pt agotaba la RAM) y la
+- **Memoria:** se devuelve al sistema la memoria liberada (`malloc_trim` periódico y ajustes
+  de malloc en el lanzador) y el recolector de Lua limpia antes. No cambia gráficos ni luces.
+- **Memoria (fuentes):** tope al tamaño de las fuentes (una fuente de 190 pt agotaba la RAM) y la
   pantalla inferior solo se redibuja cuando cambia.
 - **Texto:** conversión UTF-8 propia, porque el firmware no trae los módulos gconv.
 

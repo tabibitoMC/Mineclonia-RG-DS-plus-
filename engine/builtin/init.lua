@@ -5,6 +5,10 @@
 -- before loading and running any mods.
 --
 
+-- [RG DS Plus] Collect garbage a bit earlier: lower peak Lua memory on a 1 GB console
+collectgarbage("setpause", 140)
+collectgarbage("setstepmul", 300)
+
 -- Initialize some very basic things
 function core.error_handler(err, level)
 	return debug.traceback(tostring(err), level)

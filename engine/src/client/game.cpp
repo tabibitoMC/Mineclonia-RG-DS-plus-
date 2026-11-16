@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <malloc.h>
+#endif
 #include "client/rgds_ui.h"
 #include "game_internal.h"
 
@@ -3748,6 +3751,10 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 				fclose(f);
 			}
 			infostream << "[mem] rss=" << rss * 4 / 1024 << " MB" << std::endl;
+#ifdef __GLIBC__
+			// Hand freed heap pages back to the system (matters with 1 GB of RAM)
+			malloc_trim(0);
+#endif
 		}
 	}
 

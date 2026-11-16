@@ -378,12 +378,42 @@ void Hud::drawLuaElements(const v3s16 &camera_offset, bool only_unhidable)
 		return l->z_index < r->z_index;
 	});
 
+	// [RG DS Plus] The hotbar lives on the bottom screen, so the bars that sat
+	// above it move to the top edge of the top screen, like on the 3DS. The main
+	// row (health and hunger: the lowest stat bars) goes to the very top with the
+	// experience bar under it; rows that were stacked above the main row (armor,
+	// air) and texts like the held item's name are stacked below instead.
+	s32 rgds_shift = 0;
+	s32 main_top = 0;
+	if (RenderingEngine::isDualScreen()) {
+		bool found = false;
+		for (HudElement *e : elems) {
+			if (e->pos.Y < 0.99f || e->type != HUD_ELEM_STATBAR)
+				continue;
+			const s32 top = e->offset.Y * m_scale_factor;
+			if (top < 0 && (!found || top > main_top)) {
+				main_top = top;
+				found = true;
+			}
+		}
+		if (found)
+			rgds_shift = (s32)m_screensize.Y + main_top - (s32)(6 * m_scale_factor);
+	}
+
 	for (HudElement *e : elems) {
 		if (only_unhidable && e->hideable)
 			continue;
 
+		const bool rgds_move = rgds_shift > 0 && e->pos.Y >= 0.99f &&
+				(e->type == HUD_ELEM_STATBAR || e->type == HUD_ELEM_IMAGE || e->type == HUD_ELEM_TEXT);
 		v2s32 pos(floor(e->pos.X * (float) m_screensize.X + 0.5),
 				floor(e->pos.Y * (float) m_screensize.Y + 0.5));
+		if (rgds_move) {
+			pos.Y -= rgds_shift;
+			const s32 top = e->offset.Y * m_scale_factor;
+			if (top < main_top - (s32)(4 * m_scale_factor))
+				pos.Y += -top + (main_top - top) - (s32)(24 * m_scale_factor);
+		}
 		switch (e->type) {
 			case HUD_ELEM_TEXT: {
 				unsigned int font_size = g_fontengine->getDefaultFontSize();

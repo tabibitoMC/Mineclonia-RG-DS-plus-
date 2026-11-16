@@ -95,6 +95,11 @@ fi
 echo 60 > /proc/sys/vm/swappiness 2>/dev/null
 echo "--- memoria con swap"  >> "$LOG"; free -m >> "$LOG" 2>&1
 
+# Memoria: menos fragmentacion y devolver al sistema lo que se libera
+export MALLOC_ARENA_MAX=2
+export MALLOC_TRIM_THRESHOLD_=131072
+export MALLOC_MMAP_THRESHOLD_=131072
+
 echo "--- arrancando" >> "$LOG"
 ./bin/luanti --config "$DIR/minetest.conf" --logfile "$DIR/debug.txt" >> "$LOG" 2>&1
 CODE=$?

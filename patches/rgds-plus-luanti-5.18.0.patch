@@ -1,3 +1,18 @@
+diff --git a/builtin/init.lua b/builtin/init.lua
+index d2ee8f0..3489d49 100644
+--- a/builtin/init.lua
++++ b/builtin/init.lua
+@@ -5,6 +5,10 @@
+ -- before loading and running any mods.
+ --
+ 
++-- [RG DS Plus] Collect garbage a bit earlier: lower peak Lua memory on a 1 GB console
++collectgarbage("setpause", 140)
++collectgarbage("setstepmul", 300)
++
+ -- Initialize some very basic things
+ function core.error_handler(err, level)
+ 	return debug.traceback(tostring(err), level)
 diff --git a/builtin/mainmenu/init.lua b/builtin/mainmenu/init.lua
 index eca3c40..9260292 100644
 --- a/builtin/mainmenu/init.lua
@@ -851,18 +866,21 @@ index 37a7fc3..6ebc1fe 100644
  
  	const auto &cache = m_font_cache[spec.getHash()];
 diff --git a/src/client/game.cpp b/src/client/game.cpp
-index f901556..dfd65cc 100644
+index f901556..2c104a4 100644
 --- a/src/client/game.cpp
 +++ b/src/client/game.cpp
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,10 @@
  // SPDX-License-Identifier: LGPL-2.1-or-later
  // Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
  
++#if defined(__linux__) && !defined(__ANDROID__)
++#include <malloc.h>
++#endif
 +#include "client/rgds_ui.h"
  #include "game_internal.h"
  
  #include <cmath>
-@@ -1579,6 +1580,12 @@ void Game::processItemSelection(u16 *new_playeritem)
+@@ -1579,6 +1583,12 @@ void Game::processItemSelection(u16 *new_playeritem)
  		}
  	}
  
@@ -875,7 +893,7 @@ index f901556..dfd65cc 100644
  	if (g_touchcontrols) {
  		std::optional<u16> selection = g_touchcontrols->getHotbarSelection();
  		if (selection)
-@@ -3728,6 +3735,55 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
+@@ -3728,6 +3738,59 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
  
  	this->driver->endScene();
  
@@ -892,6 +910,10 @@ index f901556..dfd65cc 100644
 +				fclose(f);
 +			}
 +			infostream << "[mem] rss=" << rss * 4 / 1024 << " MB" << std::endl;
++#ifdef __GLIBC__
++			// Hand freed heap pages back to the system (matters with 1 GB of RAM)
++			malloc_trim(0);
++#endif
 +		}
 +	}
 +
@@ -945,7 +967,7 @@ index b10e8da..e859feb 100644
  	auto fs_src = std::make_unique<PlayerInventoryFormSource>(m_client);
  
 diff --git a/src/client/hud.cpp b/src/client/hud.cpp
-index 3bcde6f..99e806f 100644
+index 3bcde6f..419cac0 100644
 --- a/src/client/hud.cpp
 +++ b/src/client/hud.cpp
 @@ -4,6 +4,7 @@
@@ -956,7 +978,50 @@ index 3bcde6f..99e806f 100644
  #include "hud.h"
  #include <string>
  #include <iostream>
-@@ -579,6 +580,9 @@ void Hud::drawLuaElements(const v3s16 &camera_offset, bool only_unhidable)
+@@ -377,12 +378,42 @@ void Hud::drawLuaElements(const v3s16 &camera_offset, bool only_unhidable)
+ 		return l->z_index < r->z_index;
+ 	});
+ 
++	// [RG DS Plus] The hotbar lives on the bottom screen, so the bars that sat
++	// above it move to the top edge of the top screen, like on the 3DS. The main
++	// row (health and hunger: the lowest stat bars) goes to the very top with the
++	// experience bar under it; rows that were stacked above the main row (armor,
++	// air) and texts like the held item's name are stacked below instead.
++	s32 rgds_shift = 0;
++	s32 main_top = 0;
++	if (RenderingEngine::isDualScreen()) {
++		bool found = false;
++		for (HudElement *e : elems) {
++			if (e->pos.Y < 0.99f || e->type != HUD_ELEM_STATBAR)
++				continue;
++			const s32 top = e->offset.Y * m_scale_factor;
++			if (top < 0 && (!found || top > main_top)) {
++				main_top = top;
++				found = true;
++			}
++		}
++		if (found)
++			rgds_shift = (s32)m_screensize.Y + main_top - (s32)(6 * m_scale_factor);
++	}
++
+ 	for (HudElement *e : elems) {
+ 		if (only_unhidable && e->hideable)
+ 			continue;
+ 
++		const bool rgds_move = rgds_shift > 0 && e->pos.Y >= 0.99f &&
++				(e->type == HUD_ELEM_STATBAR || e->type == HUD_ELEM_IMAGE || e->type == HUD_ELEM_TEXT);
+ 		v2s32 pos(floor(e->pos.X * (float) m_screensize.X + 0.5),
+ 				floor(e->pos.Y * (float) m_screensize.Y + 0.5));
++		if (rgds_move) {
++			pos.Y -= rgds_shift;
++			const s32 top = e->offset.Y * m_scale_factor;
++			if (top < main_top - (s32)(4 * m_scale_factor))
++				pos.Y += -top + (main_top - top) - (s32)(24 * m_scale_factor);
++		}
+ 		switch (e->type) {
+ 			case HUD_ELEM_TEXT: {
+ 				unsigned int font_size = g_fontengine->getDefaultFontSize();
+@@ -579,6 +610,9 @@ void Hud::drawLuaElements(const v3s16 &camera_offset, bool only_unhidable)
  				client->getMinimap()->drawMinimap(rect);
  				break; }
  			case HUD_ELEM_HOTBAR: {
@@ -966,7 +1031,7 @@ index 3bcde6f..99e806f 100644
  				drawHotbar(pos, e->offset, e->dir, e->align);
  				break; }
  			default:
-@@ -790,6 +794,59 @@ void Hud::drawStatbar(v2s32 pos, u16 corner, u16 drawdir,
+@@ -790,6 +824,59 @@ void Hud::drawStatbar(v2s32 pos, u16 corner, u16 drawdir,
  		}
  	}
  }
