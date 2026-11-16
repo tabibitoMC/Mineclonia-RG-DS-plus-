@@ -1,0 +1,77 @@
+LUANTI 5.18 + MINECLONIA 0.124.1 PARA ANBERNIC RG DS PLUS (Linux stock)
+Version personal de Nick - doble pantalla y controles con botones
+
+INSTALAR
+1. Copia la carpeta PORTS de este zip dentro de Roms/ de la SD
+   (combinar carpetas). Si tu SD ya tiene "ports" en minuscula,
+   pon Luanti.sh y la carpeta luanti dentro de esa.
+2. En la consola abre la seccion de Ports y ejecuta "Luanti".
+   La primera carga tarda (1-3 minutos).
+
+ESTILO
+- Fuente pixelada estilo Minecraft (Monocraft, licencia libre OFL).
+- Pantalla de titulo arriba: panorama, logo grande y frase amarilla.
+- Menus con fondo de tierra y botones de piedra.
+- Para volver a la fuente normal, borra las lineas font_path... de
+  minetest.conf.
+
+PANTALLAS
+- Arriba: el mundo, corazones y comida.
+- Abajo (tactil), como en la version de 3DS:
+    * Barra de objetos: toca un objeto para elegirlo.
+    * Coordenadas.
+    * Zona grande: desliza el dedo para mover la camara.
+    * Botones: Inventario, Camara (1a/3a persona) y Pausa.
+  El inventario, cofres, mesas y menus tambien se abren abajo y se
+  manejan con el dedo o el lapiz.
+
+CONTROLES EN MENUS (menu principal, inventario, pausa, cofres)
+  Cruceta / Stick .. moverse entre botones (arriba/abajo tambien
+                     recorre listas, como la de mundos)
+  A ................ aceptar / entrar
+  B ................ volver / cerrar
+  L1 / R1 .......... cambiar de pestana
+  START ............ cerrar ventana
+  Tambien puedes tocar todo con el dedo en la pantalla de abajo.
+
+CONTROLES JUGANDO
+  Stick ............ caminar
+  X (arriba) ....... mirar arriba
+  B (abajo) ........ mirar abajo
+  Y (izquierda) .... mirar a la izquierda
+  A (derecha) ...... mirar a la derecha
+  R1 ............... atacar / picar
+  L1 ............... colocar bloque / abrir cofres y mesas / usar
+  R2 o Cruceta ↑ ... saltar
+  L2 ............... agacharse
+  Cruceta ← → ...... cambiar objeto de la barra
+  Cruceta ↓ ........ soltar objeto
+  L3 (apretar stick) correr
+  SELECT ........... abrir/cerrar inventario
+  START ............ menu de pausa / cerrar ventanas
+
+AJUSTES (luanti/minetest.conf, se edita con el bloc de notas)
+- Velocidad de camara con botones: joystick_frustum_sensitivity (110)
+- Velocidad del touchpad: touchpad_camera_sensitivity (1.5)
+- Si la camara va al reves (por ejemplo X baja en vez de subir),
+  intercambia los numeros de keymap_camera_pitch_up / pitch_down
+  (o yaw_left / yaw_right).
+- Mas FPS: undersampling = 2 o viewing_range = 30.
+- Si las pantallas salen al reves: en Luanti.sh cambia
+  LUANTI_TOP_DISPLAY=1 y LUANTI_BOTTOM_DISPLAY=0.
+- Solo pantalla de arriba: en Luanti.sh pon LUANTI_DUALSCREEN=0.
+
+SI EL TACTIL NO RESPONDE O TOCA EN OTRO LUGAR
+  En debug.txt busca las lineas que empiezan con [touch]: dicen que
+  pantalla tactil encontro y donde detecto cada toque. Pasaselas a
+  Claude. Las opciones de giro estan en Luanti.sh.
+
+SI ALGO FALLA
+Despues de intentarlo, en la SD quedan:
+  PORTS/luanti/log.txt   (informacion del sistema)
+  PORTS/luanti/debug.txt (registro del juego)
+Pasaselos a Claude para corregirlo.
+
+CODIGO
+rgds-plus-cambios.patch = los cambios hechos al motor (para tu repo privado).
+Luanti: LGPL 2.1+. Mineclonia: GPL 3. Uso personal.

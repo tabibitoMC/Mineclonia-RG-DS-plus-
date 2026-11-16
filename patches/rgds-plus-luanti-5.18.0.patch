@@ -1,0 +1,1869 @@
+diff --git a/builtin/mainmenu/init.lua b/builtin/mainmenu/init.lua
+index eca3c40..9260292 100644
+--- a/builtin/mainmenu/init.lua
++++ b/builtin/mainmenu/init.lua
+@@ -14,6 +14,35 @@ local basepath = core.get_builtin_path()
+ defaulttexturedir = core.get_texturepath_share() .. DIR_DELIM .. "base" ..
+ 					DIR_DELIM .. "pack" .. DIR_DELIM
+ 
++-- [RG DS Plus] Minecraft-style theme for every main menu formspec
++do
++	local d = defaulttexturedir
++	local function esc(p) return core.formspec_escape(p) end
++	local theme = table.concat({
++		"bgcolor[#00000088;false]",
++		"style_type[button;bgimg=", esc(d .. "rgds_btn.png"),
++		";bgimg_hovered=", esc(d .. "rgds_btn_hover.png"),
++		";bgimg_pressed=", esc(d .. "rgds_btn_pressed.png"),
++		";bgimg_middle=8;border=false;textcolor=#E0E0E0]",
++		"style_type[field,pwdfield,textarea;textcolor=#FFFFFF]",
++		"style_type[label;textcolor=#FFFFFF]",
++		"style_type[tabheader;textcolor=#E0E0E0]",
++	})
++	local header_el = {formspec_version = true, size = true, position = true, anchor = true,
++		padding = true, no_prepend = true, real_coordinates = true, allow_close = true}
++	local function apply(fs)
++		if type(fs) ~= "string" or fs == "" then return fs end
++		local pos = 1
++		while true do
++			local s, e, name = fs:find("^%s*([%w_]+)%[[^%]]*%]", pos)
++			if s and header_el[name] then pos = e + 1 else break end
++		end
++		return fs:sub(1, pos - 1) .. theme .. fs:sub(pos)
++	end
++	local update_formspec = core.update_formspec
++	core.update_formspec = function(fs) return update_formspec(apply(fs)) end
++end
++
+ dofile(basepath .. "common" .. DIR_DELIM .. "menu.lua")
+ dofile(basepath .. "common" .. DIR_DELIM .. "filterlist.lua")
+ dofile(basepath .. "fstk" .. DIR_DELIM .. "buttonbar.lua")
+diff --git a/irr/include/IrrlichtDevice.h b/irr/include/IrrlichtDevice.h
+index 263166a..7b47c0c 100644
+--- a/irr/include/IrrlichtDevice.h
++++ b/irr/include/IrrlichtDevice.h
+@@ -324,6 +324,16 @@ class IrrlichtDevice : public virtual IReferenceCounted
+ 	//! Returns 0.0f on failure.
+ 	virtual float getDisplayDensity() const = 0;
+ 
++	//! [RG DS Plus] True if a second physical screen (bottom) is in use.
++	virtual bool hasSecondScreen() const { return false; }
++
++	//! [RG DS Plus] Redirect rendering to the second screen.
++	//! Call driver->beginScene()/endScene() between this and endSecondScreen().
++	virtual bool beginSecondScreen() { return false; }
++
++	//! [RG DS Plus] Restore rendering to the main (top) screen.
++	virtual void endSecondScreen() {}
++
+ 	//! Check if a driver type is supported by the engine.
+ 	/** Even if true is returned the driver may not be available
+ 	for a configuration requested when creating the device. */
+diff --git a/irr/src/CIrrDeviceSDL.cpp b/irr/src/CIrrDeviceSDL.cpp
+index 38a1bde..29045c1 100644
+--- a/irr/src/CIrrDeviceSDL.cpp
++++ b/irr/src/CIrrDeviceSDL.cpp
+@@ -5,6 +5,14 @@
+ #ifdef _IRR_COMPILE_WITH_SDL_DEVICE_
+ 
+ #include "CIrrDeviceSDL.h"
++#include <tuple>
++#include <vector>
++#include <string>
++
++#if defined(__linux__) && !defined(_IRR_USE_SDL3_)
++#include "rgds_evdev.h"
++#define RGDS_EVDEV 1
++#endif
+ #include "IEventReceiver.h"
+ #include "IGUIElement.h"
+ #include "IGUIEnvironment.h"
+@@ -434,6 +442,12 @@ CIrrDeviceSDL::CIrrDeviceSDL(const SIrrlichtCreationParameters &param) :
+ 			Close = true;
+ 			return;
+ 		}
++#ifndef _IRR_USE_SDL3_
++		setupDualScreen();
++#endif
++#ifdef RGDS_EVDEV
++		setupEvdevTouch();
++#endif
+ 	}
+ 
+ 	core::stringc sdlver = "SDL ";
+@@ -471,6 +485,13 @@ CIrrDeviceSDL::~CIrrDeviceSDL()
+ 		SDL_GL_MakeCurrent(Window, NULL);
+ 		SDL_GL_DestroyContext(Context);
+ 	}
++	if (Window2) {
++		SDL_DestroyWindow(Window2);
++		Window2 = nullptr;
++	}
++#ifdef RGDS_EVDEV
++	rgds_touch_close();
++#endif
+ 	if (Window) {
+ 		SDL_DestroyWindow(Window);
+ 	}
+@@ -686,7 +707,17 @@ bool CIrrDeviceSDL::createWindowWithContext()
+ #ifdef _IRR_USE_SDL3_
+ 	Window = SDL_CreateWindow("", Width, Height, SDL_Flags);
+ #else
+-	Window = SDL_CreateWindow("", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, Width, Height, SDL_Flags);
++	{
++		// [RG DS Plus] place the main window on the top display
++		int disp = 0;
++		if (const char *e = getenv("LUANTI_TOP_DISPLAY"))
++			disp = atoi(e);
++		if (disp < 0 || disp >= SDL_GetNumVideoDisplays())
++			disp = 0;
++		TopDisplay = disp;
++		Window = SDL_CreateWindow("", SDL_WINDOWPOS_CENTERED_DISPLAY(disp),
++				SDL_WINDOWPOS_CENTERED_DISPLAY(disp), Width, Height, SDL_Flags);
++	}
+ #endif
+ 	if (!Window) {
+ 		os::Printer::log("Could not create window", SDL_GetError(), ELL_WARNING);
+@@ -773,6 +804,72 @@ bool CIrrDeviceSDL::run()
+ 	SEvent irrevent;
+ 	SDL_Event SDL_event;
+ 
++#ifdef RGDS_EVDEV
++	pollEvdevTouch();
++#endif
++	// [RG DS Plus] test hooks: LUANTI_DBG_INPUT="12:tap:300:200;15:pad:1" (seconds since start)
++	{
++		static std::vector<std::tuple<u32, int, int, int>> script; // ms, kind(0 tap,1 pad), a, b
++		static bool parsed = false;
++		static u32 t0 = os::Timer::getRealTime();
++		if (!parsed) {
++			parsed = true;
++			if (const char *e = getenv("LUANTI_DBG_INPUT")) {
++				std::string str = e;
++				size_t pos = 0;
++				while (pos < str.size()) {
++					size_t end = str.find(';', pos);
++					if (end == std::string::npos) end = str.size();
++					std::string item = str.substr(pos, end - pos);
++					unsigned sec = 0; int a = 0, b = 0; char kind[8] = {};
++					if (sscanf(item.c_str(), "%u:%7[a-z]:%d:%d", &sec, kind, &a, &b) >= 3)
++						script.emplace_back(sec * 1000, std::string(kind) == "tap" ? 0 : (std::string(kind) == "drag" ? 2 : 1), a, b);
++					pos = end + 1;
++				}
++			}
++		}
++		const u32 now = os::Timer::getRealTime() - t0;
++		for (auto it = script.begin(); it != script.end();) {
++			if (std::get<0>(*it) > now) { ++it; continue; }
++			SEvent e;
++			if (std::get<1>(*it) == 2) {
++				// drag: from the pad center by (a, b) pixels in 10 steps
++				e.EventType = EET_TOUCH_INPUT_EVENT;
++				e.TouchInput.ID = 0;
++				e.TouchInput.touchedCount = 1;
++				const int x0 = Width * 3 / 8, y0 = Height * 3 / 5;
++				for (int k = 0; k <= 10; k++) {
++					e.TouchInput.X = x0 + std::get<2>(*it) * k / 10;
++					e.TouchInput.Y = y0 + std::get<3>(*it) * k / 10;
++					e.TouchInput.Event = k == 0 ? ETIE_PRESSED_DOWN : ETIE_MOVED;
++					postEventFromUser(e);
++				}
++				e.TouchInput.Event = ETIE_LEFT_UP;
++				postEventFromUser(e);
++			} else if (std::get<1>(*it) == 0) {
++				e.EventType = EET_TOUCH_INPUT_EVENT;
++				e.TouchInput.ID = 0;
++				e.TouchInput.X = std::get<2>(*it);
++				e.TouchInput.Y = std::get<3>(*it);
++				e.TouchInput.Event = ETIE_PRESSED_DOWN;
++				e.TouchInput.touchedCount = 1;
++				postEventFromUser(e);
++				e.TouchInput.Event = ETIE_LEFT_UP;
++				postEventFromUser(e);
++			} else {
++				e.EventType = EET_GAMEPAD_BUTTON_EVENT;
++				e.GamepadButtonEvent.ID = 0;
++				e.GamepadButtonEvent.Button = (GamepadButton)std::get<2>(*it);
++				e.GamepadButtonEvent.PressedDown = true;
++				postEventFromUser(e);
++				e.GamepadButtonEvent.PressedDown = false;
++				postEventFromUser(e);
++			}
++			os::Printer::log("[dbg] injected input", ELL_WARNING);
++			it = script.erase(it);
++		}
++	}
++
+ 	auto get_touch_id_x_y = [this, &irrevent, &SDL_event]() {
+ 		irrevent.TouchInput.ID = SDL_FINGER_ID(SDL_event);
+ 		irrevent.TouchInput.X = static_cast<s32>(SDL_event.tfinger.x * Width);
+@@ -800,6 +897,8 @@ bool CIrrDeviceSDL::run()
+ 
+ 		switch (SDL_event.type) {
+ 		case SDL_EVENT_MOUSE_MOTION: {
++			if (TouchFd >= 0 && rgds_touch_events() > 0)
++				break; // [RG DS Plus] no mouse here; ignore touch emulated by the system
+ 			SDL_Keymod keymod = SDL_GetModState();
+ 
+ 			irrevent.EventType = EET_MOUSE_INPUT_EVENT;
+@@ -858,6 +957,8 @@ bool CIrrDeviceSDL::run()
+ 		}
+ 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+ 		case SDL_EVENT_MOUSE_BUTTON_UP: {
++			if (TouchFd >= 0 && rgds_touch_events() > 0)
++				break; // [RG DS Plus] see above
+ 			SDL_Keymod keymod = SDL_GetModState();
+ 
+ 			irrevent.EventType = EET_MOUSE_INPUT_EVENT;
+@@ -992,6 +1093,8 @@ bool CIrrDeviceSDL::run()
+ 			break;
+ #else
+ 		case SDL_WINDOWEVENT:
++			if (Window2 && SDL_event.window.windowID != SDL_GetWindowID(Window))
++				break; // [RG DS Plus] ignore events of the bottom window
+ 			switch (SDL_event.window.event) {
+ 			case SDL_WINDOWEVENT_RESIZED:
+ 			case SDL_WINDOWEVENT_SIZE_CHANGED:
+@@ -1013,9 +1116,22 @@ bool CIrrDeviceSDL::run()
+ 			break;
+ 
+ 		case SDL_EVENT_FINGER_DOWN:
++			if (TouchFd >= 0 && rgds_touch_events() > 0)
++				break; // [RG DS Plus] evdev reader handles the touchscreen
+ 			irrevent.EventType = EET_TOUCH_INPUT_EVENT;
+ 			irrevent.TouchInput.Event = ETIE_PRESSED_DOWN;
+ 			get_touch_id_x_y();
++			{
++				static int logged = 0;
++				if (logged++ < 6) {
++					char buf[128];
++					snprintf(buf, sizeof(buf), "[sdltouch] down %.3f,%.3f -> %d,%d",
++							SDL_event.tfinger.x, SDL_event.tfinger.y,
++							irrevent.TouchInput.X, irrevent.TouchInput.Y);
++					os::Printer::log(buf, ELL_WARNING);
++				}
++				rgds_touch_note_sdl(SDL_event.tfinger.x, SDL_event.tfinger.y);
++			}
+ 			CurrentTouchCount++;
+ 			irrevent.TouchInput.touchedCount = CurrentTouchCount;
+ 
+@@ -1023,6 +1139,8 @@ bool CIrrDeviceSDL::run()
+ 			break;
+ 
+ 		case SDL_EVENT_FINGER_MOTION:
++			if (TouchFd >= 0 && rgds_touch_events() > 0)
++				break;
+ 			irrevent.EventType = EET_TOUCH_INPUT_EVENT;
+ 			irrevent.TouchInput.Event = ETIE_MOVED;
+ 			get_touch_id_x_y();
+@@ -1032,6 +1150,8 @@ bool CIrrDeviceSDL::run()
+ 			break;
+ 
+ 		case SDL_EVENT_FINGER_UP:
++			if (TouchFd >= 0 && rgds_touch_events() > 0)
++				break;
+ 			irrevent.EventType = EET_TOUCH_INPUT_EVENT;
+ 			irrevent.TouchInput.Event = ETIE_LEFT_UP;
+ 			get_touch_id_x_y();
+@@ -1068,6 +1188,21 @@ bool CIrrDeviceSDL::run()
+ 			break;
+ 
+ #if defined(_IRR_COMPILE_WITH_JOYSTICK_EVENTS_)
++#ifndef _IRR_USE_SDL3_
++		case SDL_JOYDEVICEADDED: {
++			// [RG DS Plus] diagnostics: report joysticks SDL doesn't know as gamepads
++			const int idx = SDL_event.jdevice.which;
++			if (!SDL_IsGameController(idx)) {
++				char guid[64];
++				SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(idx), guid, sizeof(guid));
++				char buf[256];
++				snprintf(buf, sizeof(buf), "[pad] joystick '%s' GUID %s is NOT a known gamepad (needs SDL_GAMECONTROLLERCONFIG)",
++						SDL_JoystickNameForIndex(idx) ? SDL_JoystickNameForIndex(idx) : "?", guid);
++				os::Printer::log(buf, ELL_WARNING);
++			}
++			break;
++		}
++#endif
+ 		case SDL_EVENT_GAMEPAD_ADDED: {
+ #ifdef _IRR_USE_SDL3_
+ 			auto id = SDL_event.gdevice.which;
+@@ -1200,9 +1335,154 @@ float CIrrDeviceSDL::getDisplayDensity() const
+ 
+ void CIrrDeviceSDL::SwapWindow()
+ {
+-	SDL_GL_SwapWindow(Window);
++	SDL_GL_SwapWindow(CurrentTarget ? CurrentTarget : Window);
++}
++
++// ---------------------------------------------------------------------------
++// [RG DS Plus] Dual screen support.
++// The main window lives on the top display. A second fullscreen GL window is
++// opened on the bottom display and shares the same GL context, so the engine
++// can draw the GUI (inventory, menus, chat) there every frame.
++// Env vars: LUANTI_DUALSCREEN=0 disables it, LUANTI_TOP_DISPLAY / LUANTI_BOTTOM_DISPLAY
++// choose the SDL display indices (defaults 0 / 1).
++// ---------------------------------------------------------------------------
++#ifdef RGDS_EVDEV
++// [RG DS Plus] evdev touchscreen (implementation in rgds_evdev.cpp)
++void CIrrDeviceSDL::setupEvdevTouch()
++{
++	TouchFd = rgds_touch_open([](const char *msg, bool warn) {
++		os::Printer::log(msg, warn ? ELL_WARNING : ELL_INFORMATION);
++	});
++}
++
++void CIrrDeviceSDL::pollEvdevTouch()
++{
++	if (TouchFd < 0)
++		return;
++	rgds_touch_poll([this](int slot, int type, float nx, float ny) {
++		SEvent e;
++		e.EventType = EET_TOUCH_INPUT_EVENT;
++		e.TouchInput.Event = type == 0 ? ETIE_PRESSED_DOWN :
++				(type == 1 ? ETIE_MOVED : ETIE_LEFT_UP);
++		e.TouchInput.ID = slot;
++		e.TouchInput.X = (s32)(nx * Width);
++		e.TouchInput.Y = (s32)(ny * Height);
++		if (type == 0)
++			CurrentTouchCount++;
++		e.TouchInput.touchedCount = CurrentTouchCount;
++		if (type == 2 && CurrentTouchCount > 0)
++			CurrentTouchCount--;
++		postEventFromUser(e);
++	});
++}
++
++void CIrrDeviceSDL::emitEvdevTouch(int, ETOUCH_INPUT_EVENT) {}
++#endif
++
++#ifndef _IRR_USE_SDL3_
++void CIrrDeviceSDL::setupDualScreen()
++{
++	CurrentTarget = Window;
++	const int n = SDL_GetNumVideoDisplays();
++	{
++		char buf[256];
++		snprintf(buf, sizeof(buf), "[dualscreen] SDL video driver: %s, displays: %d",
++				SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?", n);
++		os::Printer::log(buf, ELL_INFORMATION);
++		for (int i = 0; i < n; i++) {
++			SDL_Rect r{};
++			SDL_GetDisplayBounds(i, &r);
++			SDL_DisplayMode m{};
++			SDL_GetCurrentDisplayMode(i, &m);
++			snprintf(buf, sizeof(buf), "[dualscreen] display %d '%s': bounds %d,%d %dx%d mode %dx%d@%d",
++					i, SDL_GetDisplayName(i) ? SDL_GetDisplayName(i) : "?",
++					r.x, r.y, r.w, r.h, m.w, m.h, m.refresh_rate);
++			os::Printer::log(buf, ELL_INFORMATION);
++		}
++	}
++	const char *en = getenv("LUANTI_DUALSCREEN");
++	if (en && en[0] == '0') {
++		os::Printer::log("[dualscreen] disabled by LUANTI_DUALSCREEN=0", ELL_INFORMATION);
++		return;
++	}
++	// LUANTI_DUALSCREEN_TEST=1: desktop testing, bottom window placed to the right
++	const char *tst = getenv("LUANTI_DUALSCREEN_TEST");
++	const bool test_mode = tst && tst[0] == '1' && n < 2;
++	if (n < 2 && !test_mode) {
++		os::Printer::log("[dualscreen] only one display found, running single screen", ELL_WARNING);
++		return;
++	}
++	int bottom = (TopDisplay == 0) ? 1 : 0;
++	if (const char *e = getenv("LUANTI_BOTTOM_DISPLAY"))
++		bottom = atoi(e);
++	if (test_mode)
++		bottom = TopDisplay;
++	else if (bottom < 0 || bottom >= n || bottom == TopDisplay) {
++		os::Printer::log("[dualscreen] invalid bottom display", ELL_WARNING);
++		return;
++	}
++
++	u32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_BORDERLESS;
++	if (CreationParams.Fullscreen)
++		flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
++	SDL_Rect b{};
++	SDL_GetDisplayBounds(bottom, &b);
++	// Same pixel size as the main window, so GUI coordinates match 1:1.
++	int w = Width ? (int)Width : b.w, h = Height ? (int)Height : b.h;
++	if (test_mode) {
++		flags = SDL_WINDOW_OPENGL | SDL_WINDOW_BORDERLESS;
++		SDL_SetWindowPosition(Window, 0, 0);
++		Window2 = SDL_CreateWindow("Luanti bottom", w, 0, w, h, flags);
++	} else {
++		Window2 = SDL_CreateWindow("Luanti bottom", SDL_WINDOWPOS_CENTERED_DISPLAY(bottom),
++				SDL_WINDOWPOS_CENTERED_DISPLAY(bottom), w, h, flags);
++	}
++	if (!Window2) {
++		os::Printer::log("[dualscreen] could not create bottom window", SDL_GetError(), ELL_WARNING);
++		return;
++	}
++	if (SDL_GL_MakeCurrent(Window2, Context) != 0) {
++		os::Printer::log("[dualscreen] cannot share GL context with bottom window", SDL_GetError(), ELL_WARNING);
++		SDL_DestroyWindow(Window2);
++		Window2 = nullptr;
++		SDL_GL_MakeCurrent(Window, Context);
++		return;
++	}
++	// Don't wait for vblank twice per frame.
++	SDL_GL_SetSwapInterval(0);
++	SDL_GL_MakeCurrent(Window, Context);
++	SDL_RaiseWindow(Window);
++	int w2, h2;
++	SDL_GL_GetDrawableSize(Window2, &w2, &h2);
++	char buf[160];
++	snprintf(buf, sizeof(buf), "[dualscreen] bottom window on display %d, %dx%d (top %ux%u)",
++			bottom, w2, h2, Width, Height);
++	os::Printer::log(buf, ELL_INFORMATION);
++}
++
++bool CIrrDeviceSDL::beginSecondScreen()
++{
++	if (!Window2)
++		return false;
++	if (SDL_GL_MakeCurrent(Window2, Context) != 0)
++		return false;
++	CurrentTarget = Window2;
++	return true;
+ }
+ 
++void CIrrDeviceSDL::endSecondScreen()
++{
++	if (!Window2)
++		return;
++	SDL_GL_MakeCurrent(Window, Context);
++	CurrentTarget = Window;
++}
++#else
++void CIrrDeviceSDL::setupDualScreen() {}
++bool CIrrDeviceSDL::beginSecondScreen() { return false; }
++void CIrrDeviceSDL::endSecondScreen() {}
++#endif
++
+ //! pause execution temporarily
+ void CIrrDeviceSDL::yield()
+ {
+@@ -1395,6 +1675,8 @@ bool CIrrDeviceSDL::isWindowActive() const
+ 			return false;
+ 	}
+ #endif
++	if (Window2)
++		return true; // [RG DS Plus] focus may sit on either screen
+ 	const u64 windowFlags = SDL_GetWindowFlags(Window);
+ #ifdef _IRR_USE_SDL3_
+ 	return !(windowFlags & SDL_WINDOW_HIDDEN) && (windowFlags & SDL_WINDOW_INPUT_FOCUS);
+@@ -1406,6 +1688,8 @@ bool CIrrDeviceSDL::isWindowActive() const
+ //! returns if window has focus.
+ bool CIrrDeviceSDL::isWindowFocused() const
+ {
++	if (Window2)
++		return true;
+ 	return Window && (SDL_GetWindowFlags(Window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+ }
+ 
+diff --git a/irr/src/CIrrDeviceSDL.h b/irr/src/CIrrDeviceSDL.h
+index b2d9baa..c4b2cdd 100644
+--- a/irr/src/CIrrDeviceSDL.h
++++ b/irr/src/CIrrDeviceSDL.h
+@@ -111,6 +111,10 @@ class CIrrDeviceSDL : public CIrrDeviceStub
+ 
+ 	void SwapWindow();
+ 
++	bool hasSecondScreen() const override { return Window2 != nullptr; }
++	bool beginSecondScreen() override;
++	void endSecondScreen() override;
++
+ 	// We need this twice to handle showing an error *with* or *without*
+ 	// the SDL device even being initialized.
+ 
+@@ -302,6 +306,28 @@ class CIrrDeviceSDL : public CIrrDeviceStub
+ 	void logAttributes();
+ 	SDL_GLContext Context;
+ 	SDL_Window *Window;
++	// [RG DS Plus] second (bottom) screen
++	SDL_Window *Window2 = nullptr;
++	SDL_Window *CurrentTarget = nullptr;
++	int TopDisplay = 0;
++	void setupDualScreen();
++
++	// [RG DS Plus] touchscreen read directly from evdev (SDL may not report it)
++	int TouchFd = -1;
++	bool TouchMT = false;
++	int TouchMinX = 0, TouchMaxX = 1, TouchMinY = 0, TouchMaxY = 1;
++	int TouchRot = 0;
++	bool TouchSwapXY = false, TouchInvX = false, TouchInvY = false;
++	int TouchSlot = 0;
++	int TouchLogLeft = 8;
++	struct TouchSlotState {
++		bool active = false, pend_down = false, pend_up = false, moved = false;
++		int x = 0, y = 0;
++	} TouchSlots[10];
++	bool SingleTouchDown = false;
++	void setupEvdevTouch();
++	void pollEvdevTouch();
++	void emitEvdevTouch(int slot, ETOUCH_INPUT_EVENT ev);
+ #if defined(_IRR_COMPILE_WITH_JOYSTICK_EVENTS_)
+ 	std::map<SDL_JoystickID, SDL_Gamepad*> gamepads;
+ #ifdef _IRR_USE_SDL3
+diff --git a/irr/src/CMakeLists.txt b/irr/src/CMakeLists.txt
+index 938816b..e858f76 100644
+--- a/irr/src/CMakeLists.txt
++++ b/irr/src/CMakeLists.txt
+@@ -393,6 +393,7 @@ add_library(IRROTHEROBJ OBJECT
+ 	os.h
+ 
+ 	CIrrDeviceSDL.cpp
++	rgds_evdev.cpp
+ 	CIrrDeviceStub.cpp
+ 	CLogger.cpp
+ 	COSOperator.cpp
+diff --git a/irr/src/rgds_evdev.cpp b/irr/src/rgds_evdev.cpp
+new file mode 100644
+index 0000000..029ca9d
+--- /dev/null
++++ b/irr/src/rgds_evdev.cpp
+@@ -0,0 +1,267 @@
++// [RG DS Plus] evdev touchscreen reader.
++// On the stock firmware SDL (KMSDRM) does not deliver the bottom touchscreen
++// as touch events, so the engine reads /dev/input directly.
++// Env: LUANTI_TOUCH_EVDEV=0 disables, LUANTI_TOUCH_DEVICE=/dev/input/eventN forces
++// a device, LUANTI_TOUCH_ROTATE=0/90/180/270, LUANTI_TOUCH_SWAPXY=1,
++// LUANTI_TOUCH_INVERTX=1, LUANTI_TOUCH_INVERTY=1 fix the orientation.
++#include "rgds_evdev.h"
++
++#include <linux/input.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cctype>
++#include <string>
++#include <algorithm>
++
++#define TBIT(arr, bit) ((arr[(bit) / (8 * sizeof(long))] >> ((bit) % (8 * sizeof(long)))) & 1UL)
++
++namespace {
++int g_fd = -1;
++bool g_mt = false;
++bool g_has_slot = true; // false = MT protocol A (contacts separated by SYN_MT_REPORT)
++int g_contact = 0;
++bool g_seen[10] = {};
++int g_minx = 0, g_maxx = 1, g_miny = 0, g_maxy = 1;
++int g_rot = 0;
++bool g_swap = false, g_invx = false, g_invy = false;
++int g_slot = 0;
++int g_logleft = 10;
++rgds_log_fn g_log;
++int g_events = 0, g_touches = 0, g_sdl_touches = 0;
++float g_lastx = -1, g_lasty = -1;
++struct Slot {
++	bool active = false, pend_down = false, pend_up = false, moved = false;
++	int x = 0, y = 0;
++} g_slots[10];
++
++bool env_on(const char *n)
++{
++	const char *e = getenv(n);
++	return e && e[0] == '1';
++}
++
++void emit(const rgds_touch_fn &cb, int s, int type)
++{
++	const Slot &st = g_slots[s];
++	float nx = (float)(st.x - g_minx) / (g_maxx - g_minx);
++	float ny = (float)(st.y - g_miny) / (g_maxy - g_miny);
++	if (g_swap) std::swap(nx, ny);
++	switch (g_rot) {
++	case 90: { float t = nx; nx = ny; ny = 1.0f - t; break; }
++	case 180: nx = 1.0f - nx; ny = 1.0f - ny; break;
++	case 270: { float t = nx; nx = 1.0f - ny; ny = t; break; }
++	default: break;
++	}
++	if (g_invx) nx = 1.0f - nx;
++	if (g_invy) ny = 1.0f - ny;
++	nx = std::min(1.0f, std::max(0.0f, nx));
++	ny = std::min(1.0f, std::max(0.0f, ny));
++	if (g_logleft > 0 && type != 1 && g_log) {
++		g_logleft--;
++		char buf[160];
++		snprintf(buf, sizeof(buf), "[touch] %s slot %d raw %d,%d -> %.3f,%.3f",
++				type == 0 ? "down" : "up", s, st.x, st.y, nx, ny);
++		g_log(buf, true);
++	}
++	g_events++;
++	if (type == 0) g_touches++;
++	g_lastx = nx; g_lasty = ny;
++	cb(s, type, nx, ny);
++}
++} // namespace
++
++int rgds_touch_open(const rgds_log_fn &log)
++{
++	g_log = log;
++	const char *en = getenv("LUANTI_TOUCH_EVDEV");
++	if (en && en[0] == '0')
++		return -1;
++	char buf[400];
++	// The stock launcher disables the touch panel in the kernel driver before
++	// starting external apps (tpctrl = 1). 0 = touch enabled.
++	if (FILE *f = fopen("/sys/class/anbernic_misc/tpctrl", "w")) {
++		fputs("0\n", f);
++		fclose(f);
++		g_log("[touch] tpctrl set to 0 (touch panel enabled)", true);
++	}
++	std::string best;
++	int best_score = 0;
++	const char *forced = getenv("LUANTI_TOUCH_DEVICE");
++	for (int i = 0; i < 32; i++) {
++		std::string path = "/dev/input/event" + std::to_string(i);
++		if (forced && path != forced)
++			continue;
++		int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
++		if (fd < 0)
++			continue;
++		char name[128] = "?";
++		ioctl(fd, EVIOCGNAME(sizeof(name)), name);
++		unsigned long absbits[(ABS_MAX + 8 * sizeof(long)) / (8 * sizeof(long))] = {};
++		unsigned long keybits[(KEY_MAX + 8 * sizeof(long)) / (8 * sizeof(long))] = {};
++		unsigned long props[(INPUT_PROP_MAX + 8 * sizeof(long)) / (8 * sizeof(long))] = {};
++		ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
++		ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
++		ioctl(fd, EVIOCGPROP(sizeof(props)), props);
++		close(fd);
++		const bool mt = TBIT(absbits, ABS_MT_POSITION_X);
++		const bool st = TBIT(absbits, ABS_X) && TBIT(keybits, BTN_TOUCH);
++		const bool pad = TBIT(keybits, BTN_GAMEPAD) || TBIT(keybits, BTN_JOYSTICK);
++		const bool direct = TBIT(props, INPUT_PROP_DIRECT);
++		std::string lname = name;
++		for (auto &c : lname) c = (char)tolower((unsigned char)c);
++		const bool named = lname.find("touch") != std::string::npos ||
++				lname.find("goodix") != std::string::npos || lname.find("ft5") != std::string::npos ||
++				lname.find("gt9") != std::string::npos || lname.find("hyn") != std::string::npos ||
++				lname.find("cst") != std::string::npos || lname.find("_ts") != std::string::npos ||
++				lname.find("-ts") != std::string::npos;
++		int score = 0;
++		if ((mt || st) && (!pad || forced))
++			score = 1 + (mt ? 2 : 0) + (direct ? 4 : 0) + (named ? 2 : 0);
++		snprintf(buf, sizeof(buf), "[touch] %s '%s' mt=%d st=%d pad=%d direct=%d score=%d",
++				path.c_str(), name, mt, st, pad, direct, score);
++		g_log(buf, false);
++		if (score > best_score) {
++			best_score = score;
++			best = path;
++		}
++	}
++	if (best.empty()) {
++		g_log("[touch] no evdev touchscreen found, using SDL touch", true);
++		return -1;
++	}
++	g_fd = open(best.c_str(), O_RDONLY | O_NONBLOCK);
++	if (g_fd < 0) {
++		snprintf(buf, sizeof(buf), "[touch] cannot open %s", best.c_str());
++		g_log(buf, true);
++		return -1;
++	}
++	unsigned long absbits[(ABS_MAX + 8 * sizeof(long)) / (8 * sizeof(long))] = {};
++	ioctl(g_fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
++	g_mt = TBIT(absbits, ABS_MT_POSITION_X);
++	g_has_slot = TBIT(absbits, ABS_MT_SLOT);
++	struct input_absinfo ax{}, ay{};
++	ioctl(g_fd, EVIOCGABS(g_mt ? ABS_MT_POSITION_X : ABS_X), &ax);
++	ioctl(g_fd, EVIOCGABS(g_mt ? ABS_MT_POSITION_Y : ABS_Y), &ay);
++	g_minx = ax.minimum; g_maxx = ax.maximum > ax.minimum ? ax.maximum : ax.minimum + 1;
++	g_miny = ay.minimum; g_maxy = ay.maximum > ay.minimum ? ay.maximum : ay.minimum + 1;
++	if (const char *r = getenv("LUANTI_TOUCH_ROTATE"))
++		g_rot = atoi(r);
++	g_swap = env_on("LUANTI_TOUCH_SWAPXY");
++	g_invx = env_on("LUANTI_TOUCH_INVERTX");
++	g_invy = env_on("LUANTI_TOUCH_INVERTY");
++	snprintf(buf, sizeof(buf), "[touch] using %s mt=%d slots=%d x=%d..%d y=%d..%d rot=%d swap=%d inv=%d,%d",
++			best.c_str(), g_mt, g_has_slot, g_minx, g_maxx, g_miny, g_maxy, g_rot, g_swap, g_invx, g_invy);
++	g_log(buf, true);
++	return g_fd;
++}
++
++void rgds_touch_poll(const rgds_touch_fn &cb)
++{
++	if (g_fd < 0)
++		return;
++	struct input_event evs[64];
++	for (;;) {
++		ssize_t n = read(g_fd, evs, sizeof(evs));
++		if (n <= 0)
++			break;
++		const int cnt = (int)(n / sizeof(struct input_event));
++		for (int i = 0; i < cnt; i++) {
++			const auto &ev = evs[i];
++			if (g_mt && !g_has_slot) {
++				// MT protocol A: every contact ends with SYN_MT_REPORT, the frame
++				// with SYN_REPORT; a frame without contacts means all fingers up.
++				if (ev.type == EV_ABS && g_contact < 10) {
++					if (ev.code == ABS_MT_POSITION_X) { g_slots[g_contact].x = ev.value; g_seen[g_contact] = true; }
++					else if (ev.code == ABS_MT_POSITION_Y) { g_slots[g_contact].y = ev.value; g_seen[g_contact] = true; }
++				} else if (ev.type == EV_SYN && ev.code == SYN_MT_REPORT) {
++					g_contact++;
++				} else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
++					for (int s = 0; s < 10; s++) {
++						Slot &st = g_slots[s];
++						if (g_seen[s] && !st.active) { st.active = true; emit(cb, s, 0); }
++						else if (g_seen[s]) emit(cb, s, 1);
++						else if (st.active) { emit(cb, s, 2); st.active = false; }
++						g_seen[s] = false;
++					}
++					g_contact = 0;
++				}
++				continue;
++			}
++			Slot &cur = g_slots[g_slot];
++			if (ev.type == EV_ABS) {
++				switch (ev.code) {
++				case ABS_MT_SLOT:
++					g_slot = std::min(9, std::max(0, ev.value));
++					break;
++				case ABS_MT_TRACKING_ID:
++					if (ev.value < 0) {
++						if (cur.active) cur.pend_up = true;
++					} else if (!cur.active) {
++						cur.pend_down = true;
++					}
++					break;
++				case ABS_MT_POSITION_X: cur.x = ev.value; cur.moved = true; break;
++				case ABS_MT_POSITION_Y: cur.y = ev.value; cur.moved = true; break;
++				case ABS_X: if (!g_mt) { g_slots[0].x = ev.value; g_slots[0].moved = true; } break;
++				case ABS_Y: if (!g_mt) { g_slots[0].y = ev.value; g_slots[0].moved = true; } break;
++				default: break;
++				}
++			} else if (ev.type == EV_KEY && ev.code == BTN_TOUCH && !g_mt) {
++				// Single-touch devices, or MT devices without tracking ids
++				Slot &s0 = g_slots[0];
++				if (ev.value && !s0.active && !s0.pend_down) s0.pend_down = true;
++				if (!ev.value) {
++					for (auto &s : g_slots)
++						if (s.active) s.pend_up = true;
++				}
++			} else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
++				for (int s = 0; s < 10; s++) {
++					Slot &st = g_slots[s];
++					if (st.pend_down && !st.active) {
++						st.active = true;
++						emit(cb, s, 0);
++					} else if (st.active && st.moved && !st.pend_up) {
++						emit(cb, s, 1);
++					}
++					if (st.pend_up && st.active) {
++						emit(cb, s, 2);
++						st.active = false;
++					}
++					st.pend_down = st.pend_up = st.moved = false;
++				}
++			} else if (ev.type == EV_SYN && ev.code == SYN_DROPPED) {
++				for (int s = 0; s < 10; s++)
++					if (g_slots[s].active) {
++						emit(cb, s, 2);
++						g_slots[s].active = false;
++					}
++			}
++		}
++	}
++}
++
++void rgds_touch_close()
++{
++	if (g_fd >= 0)
++		close(g_fd);
++	g_fd = -1;
++}
++
++int rgds_touch_events() { return g_events; }
++
++void rgds_touch_note_sdl(float nx, float ny)
++{
++	g_sdl_touches++;
++	g_lastx = nx; g_lasty = ny;
++}
++
++extern "C" int rgds_touch_debug(float *nx, float *ny, int *sdl_count)
++{
++	if (nx) *nx = g_lastx;
++	if (ny) *ny = g_lasty;
++	if (sdl_count) *sdl_count = g_sdl_touches;
++	return g_touches;
++}
+diff --git a/irr/src/rgds_evdev.h b/irr/src/rgds_evdev.h
+new file mode 100644
+index 0000000..6073725
+--- /dev/null
++++ b/irr/src/rgds_evdev.h
+@@ -0,0 +1,17 @@
++// [RG DS Plus] evdev touchscreen reader (kept apart: linux/input.h clashes with Irrlicht keycodes)
++#pragma once
++#include <functional>
++
++using rgds_log_fn = std::function<void(const char *, bool)>;
++// type: 0 = down, 1 = moved, 2 = up; nx/ny normalized 0..1 (orientation applied)
++using rgds_touch_fn = std::function<void(int slot, int type, float nx, float ny)>;
++
++int rgds_touch_open(const rgds_log_fn &log);
++void rgds_touch_poll(const rgds_touch_fn &cb);
++void rgds_touch_close();
++
++// Number of touch events read from evdev so far (0 = evdev silent, SDL is used)
++int rgds_touch_events();
++// Debug info for the on-screen indicator: total touches and last position (0..1)
++void rgds_touch_note_sdl(float nx, float ny);
++extern "C" int rgds_touch_debug(float *nx, float *ny, int *sdl_count);
+diff --git a/src/client/clientlauncher.cpp b/src/client/clientlauncher.cpp
+index 0a315b0..36e9b6f 100644
+--- a/src/client/clientlauncher.cpp
++++ b/src/client/clientlauncher.cpp
+@@ -538,8 +538,11 @@ void ClientLauncher::main_menu(MainMenuData *menudata)
+ 		if (!isMenuActive())
+ 			break;
+ 		driver->beginScene(true, true, video::SColor(255, 128, 128, 128));
+-		m_rendering_engine->get_gui_env()->drawAll();
++		if (!RenderingEngine::isDualScreen())
++			m_rendering_engine->get_gui_env()->drawAll();
+ 		driver->endScene();
++		if (RenderingEngine::isDualScreen())
++			m_rendering_engine->drawBottomScreen(RenderingEngine::BS_MAINMENU, 100);
+ 		framemarker.end();
+ 		// On some computers framerate doesn't seem to be automatically limited
+ 		sleep_ms(25);
+diff --git a/src/client/fontengine.cpp b/src/client/fontengine.cpp
+index 37a7fc3..6ebc1fe 100644
+--- a/src/client/fontengine.cpp
++++ b/src/client/fontengine.cpp
+@@ -93,6 +93,15 @@ gui::IGUIFont *FontEngine::getFont(FontSpec spec, bool may_fail)
+ 	if (spec.size == FONT_SIZE_UNSPECIFIED)
+ 		spec.size = m_default_size[spec.mode];
+ 
++	// [RG DS Plus] Huge fonts (e.g. 190pt titles) need hundreds of MB of glyph
++	// pages, which kills the game on a 1 GB console. Cap the size.
++	{
++		static const unsigned max_size = g_settings->exists("font_size_max") ?
++				g_settings->getU16("font_size_max") : 64;
++		if (max_size > 0 && spec.size > max_size)
++			spec.size = max_size;
++	}
++
+ 	RecursiveMutexAutoLock l(m_font_mutex);
+ 
+ 	const auto &cache = m_font_cache[spec.getHash()];
+diff --git a/src/client/game.cpp b/src/client/game.cpp
+index f901556..dfd65cc 100644
+--- a/src/client/game.cpp
++++ b/src/client/game.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+ // Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
+ 
++#include "client/rgds_ui.h"
+ #include "game_internal.h"
+ 
+ #include <cmath>
+@@ -1579,6 +1580,12 @@ void Game::processItemSelection(u16 *new_playeritem)
+ 		}
+ 	}
+ 
++	// [RG DS Plus] slot tapped on the bottom screen
++	if (g_rgds_ui.pending_slot >= 0) {
++		*new_playeritem = g_rgds_ui.pending_slot;
++		g_rgds_ui.pending_slot = -1;
++	}
++
+ 	if (g_touchcontrols) {
+ 		std::optional<u16> selection = g_touchcontrols->getHotbarSelection();
+ 		if (selection)
+@@ -3728,6 +3735,55 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
+ 
+ 	this->driver->endScene();
+ 
++	// [RG DS Plus] memory diagnostics every 30 s
++	{
++		static u64 last_mem_log = 0;
++		const u64 now = porting::getTimeMs();
++		if (now - last_mem_log > 10000) {
++			last_mem_log = now;
++			long pages = 0, rss = 0;
++			if (FILE *f = fopen("/proc/self/statm", "r")) {
++				if (fscanf(f, "%ld %ld", &pages, &rss) != 2)
++					rss = 0;
++				fclose(f);
++			}
++			infostream << "[mem] rss=" << rss * 4 / 1024 << " MB" << std::endl;
++		}
++	}
++
++	// [RG DS Plus] bottom screen: 3DS-style game UI, or the open menu/inventory
++	if (RenderingEngine::isDualScreen()) {
++		const bool menu = isMenuActive();
++		if (!menu) {
++			RgdsUi &ui = g_rgds_ui;
++			LocalPlayer *player = client->getEnv().getLocalPlayer();
++			const v3f pp = player->getPosition() / BS;
++			wchar_t buf[96];
++			swprintf(buf, 96, L"X: %d, Y: %d, Z: %d", (int)std::floor(pp.X + 0.5f),
++					(int)std::floor(pp.Y + 0.5f), (int)std::floor(pp.Z + 0.5f));
++			ui.coords_text = buf;
++			// Signature of everything shown below: redraw only when it changes
++			u32 sig = player->getWieldIndex() * 31 + (u32)(ui.pressed_button + 2) * 7919;
++			for (wchar_t c : ui.coords_text)
++				sig = sig * 131 + c;
++			if (InventoryList *l = player->inventory.getList("main")) {
++				const u32 n = std::min<u32>(l->getSize(), RgdsUi::SLOTS);
++				for (u32 i = 0; i < n; i++) {
++					const ItemStack &it = l->getItem(i);
++					sig = sig * 131 + it.count + it.wear;
++					for (char c : it.name)
++						sig = sig * 131 + (u8)c;
++				}
++			}
++			ui.signature = sig;
++		}
++		Hud *h = this->hud;
++		this->m_rendering_engine->drawBottomScreen(
++				menu ? RenderingEngine::BS_GAME_MENU : RenderingEngine::BS_GAME,
++				menu ? 60 : 500,
++				[h] { if (h) h->drawBottomHotbar(); });
++	}
++
+ 	stats->drawtime = tt_draw.stop(true);
+ 	g_profiler->graphAdd("Draw scene [us]", stats->drawtime);
+ 
+diff --git a/src/client/game_formspec.cpp b/src/client/game_formspec.cpp
+index b10e8da..e859feb 100644
+--- a/src/client/game_formspec.cpp
++++ b/src/client/game_formspec.cpp
+@@ -320,7 +320,7 @@ void GameFormSpec::showPlayerInventory(const std::string *fs_override)
+ 	if (!player || !player->getCAO())
+ 		return;
+ 
+-	infostream << "Game: Launching inventory" << std::endl;
++	warningstream << "Game: Launching inventory" << std::endl;
+ 
+ 	auto fs_src = std::make_unique<PlayerInventoryFormSource>(m_client);
+ 
+diff --git a/src/client/hud.cpp b/src/client/hud.cpp
+index 3bcde6f..99e806f 100644
+--- a/src/client/hud.cpp
++++ b/src/client/hud.cpp
+@@ -4,6 +4,7 @@
+ // Copyright (C) 2010-2013 blue42u, Jonathon Anderson <anderjon@umail.iu.edu>
+ // Copyright (C) 2010-2013 kwolekr, Ryan Kwolek <kwolekr@minetest.net>
+ 
++#include "client/rgds_ui.h"
+ #include "hud.h"
+ #include <string>
+ #include <iostream>
+@@ -579,6 +580,9 @@ void Hud::drawLuaElements(const v3s16 &camera_offset, bool only_unhidable)
+ 				client->getMinimap()->drawMinimap(rect);
+ 				break; }
+ 			case HUD_ELEM_HOTBAR: {
++				// [RG DS Plus] with two screens the hotbar lives on the bottom one
++				if (RenderingEngine::isDualScreen())
++					break;
+ 				drawHotbar(pos, e->offset, e->dir, e->align);
+ 				break; }
+ 			default:
+@@ -790,6 +794,59 @@ void Hud::drawStatbar(v2s32 pos, u16 corner, u16 drawdir,
+ 		}
+ 	}
+ }
++void Hud::drawBottomHotbar()
++{
++	InventoryList *mainlist = inventory->getList("main");
++	if (!mainlist)
++		return;
++	const RgdsUi &ui = g_rgds_ui;
++	const u16 sel = player->getWieldIndex();
++	const s32 n = std::min<s32>({(s32)RgdsUi::SLOTS, (s32)mainlist->getSize(),
++			(s32)player->getMaxHotbarItemcount()});
++
++	// Game-provided hotbar strip and selection frame (same art as on the top screen)
++	if (!player->hotbar_image.empty()) {
++		video::ITexture *tex = tsrc->getTexture(player->hotbar_image);
++		draw2DImageFilterScaled(driver, tex, ui.hotbar,
++				core::rect<s32>(v2s32(0, 0), core::dimension2di(tex->getOriginalSize())),
++				nullptr, hbar_colors, true);
++	} else {
++		for (s32 i = 0; i < n; i++) {
++			core::rect<s32> r = ui.slot[i];
++			driver->draw2DRectangle(video::SColor(255, 40, 40, 40), r);
++			r.UpperLeftCorner += v2s32(3, 3);
++			r.LowerRightCorner -= v2s32(3, 3);
++			driver->draw2DRectangle(video::SColor(255, 139, 139, 139), r);
++		}
++	}
++	for (s32 i = 0; i < n; i++) {
++		const core::rect<s32> &r = ui.slot[i];
++		const s32 inset = r.getWidth() / 7;
++		if (i == sel) {
++			if (!player->hotbar_selected_image.empty()) {
++				video::ITexture *tex = tsrc->getTexture(player->hotbar_selected_image);
++				core::rect<s32> fr = r;
++				fr.UpperLeftCorner -= v2s32(inset / 4, inset / 4);
++				fr.LowerRightCorner += v2s32(inset / 4, inset / 4);
++				draw2DImageFilterScaled(driver, tex, fr,
++						core::rect<s32>(v2s32(0, 0), core::dimension2di(tex->getOriginalSize())),
++						nullptr, hbar_colors, true);
++			} else {
++				const video::SColor c(255, 255, 255, 255);
++				const s32 t = 4;
++				driver->draw2DRectangle(c, core::rect<s32>(r.UpperLeftCorner.X, r.UpperLeftCorner.Y, r.LowerRightCorner.X, r.UpperLeftCorner.Y + t));
++				driver->draw2DRectangle(c, core::rect<s32>(r.UpperLeftCorner.X, r.LowerRightCorner.Y - t, r.LowerRightCorner.X, r.LowerRightCorner.Y));
++				driver->draw2DRectangle(c, core::rect<s32>(r.UpperLeftCorner.X, r.UpperLeftCorner.Y, r.UpperLeftCorner.X + t, r.LowerRightCorner.Y));
++				driver->draw2DRectangle(c, core::rect<s32>(r.LowerRightCorner.X - t, r.UpperLeftCorner.Y, r.LowerRightCorner.X, r.LowerRightCorner.Y));
++			}
++		}
++		core::rect<s32> ir(r.UpperLeftCorner + v2s32(inset, inset),
++				r.LowerRightCorner - v2s32(inset, inset));
++		drawItemStack(driver, g_fontengine->getFont(), mainlist->getItem(i), ir, nullptr,
++				client, i == sel ? IT_ROT_SELECTED : IT_ROT_NONE);
++	}
++}
++
+ void Hud::drawHotbar(const v2s32 &pos, const v2f &offset, u16 dir, const v2f &align)
+ {
+ 	if (g_touchcontrols)
+diff --git a/src/client/hud.h b/src/client/hud.h
+index 9e52c3c..f9e70be 100644
+--- a/src/client/hud.h
++++ b/src/client/hud.h
+@@ -63,6 +63,8 @@ class Hud
+ 	void drawBlockBounds();
+ 
+ 	void drawHotbar(const v2s32 &pos, const v2f &offset, u16 direction, const v2f &align);
++	// [RG DS Plus] hotbar on the bottom screen, in the slots of g_rgds_ui
++	void drawBottomHotbar();
+ 	void resizeHotbar();
+ 	void drawCrosshair();
+ 	void drawSelectionMesh();
+diff --git a/src/client/inputhandler.cpp b/src/client/inputhandler.cpp
+index 0f86e1e..f251a76 100644
+--- a/src/client/inputhandler.cpp
++++ b/src/client/inputhandler.cpp
+@@ -7,6 +7,7 @@
+ #include "settings.h"
+ #include "util/numeric.h"
+ #include "inputhandler.h"
++#include "rgds_ui.h"
+ #include "gui/mainmenumanager.h"
+ #include "gui/touchcontrols.h"
+ #include "hud_element.h"
+@@ -200,6 +201,8 @@ std::pair<float, bool> MyEventReceiver::checkKeyDown(GameKeyType action) const
+ 	return std::pair(value, setWasKeyDown);
+ }
+ 
++RgdsUi g_rgds_ui;
++
+ bool MyEventReceiver::OnEvent(const SEvent &event)
+ {
+ 	if (event.EventType == EET_LOG_TEXT_EVENT) {
+@@ -268,6 +271,66 @@ bool MyEventReceiver::OnEvent(const SEvent &event)
+ 		return ret;
+ 	}
+ 
++	// [RG DS Plus] bottom screen while playing: tap the hotbar to pick an item,
++	// tap the buttons, drag anywhere else to turn the camera (like a touchpad).
++	if (!g_touchcontrols && event.EventType == EET_TOUCH_INPUT_EVENT &&
++			RenderingEngine::isDualScreen()) {
++		const auto &t = event.TouchInput;
++		const v2s32 pos(t.X, t.Y);
++		RgdsUi &ui = g_rgds_ui;
++		ui.layout(RenderingEngine::get_video_driver()->getScreenSize());
++		{
++			static int logged = 0;
++			if (t.Event != ETIE_MOVED && logged < 6) {
++				logged++;
++				warningstream << "[touchpad] event " << (int)t.Event << " at " << t.X << "," << t.Y << std::endl;
++			}
++		}
++		if (t.Event == ETIE_PRESSED_DOWN) {
++			const int slot = ui.slotAt(pos);
++			const int btn = ui.buttonAt(pos);
++			if (slot >= 0) {
++				ui.pending_slot = slot;
++			} else if (btn != RgdsUi::BTN_NONE) {
++				if (touch_button_id == (size_t)-1) {
++					touch_button_id = t.ID;
++					ui.pressed_button = btn;
++				}
++			} else if (touchpad_id == (size_t)-1) {
++				touchpad_id = t.ID;
++				touchpad_last = pos;
++			}
++		} else if (t.Event == ETIE_MOVED) {
++			if (t.ID == touchpad_id) {
++				static const float sens = g_settings->getFloat("touchpad_camera_sensitivity", 0.05f, 20.0f);
++				v2f d = v2f((pos - touchpad_last).X, (pos - touchpad_last).Y) * sens + touchpad_rest;
++				v2s32 di((s32)d.X, (s32)d.Y);
++				touchpad_rest = d - v2f(di.X, di.Y);
++				mouse_movement += di;
++				touchpad_last = pos;
++			}
++		} else {
++			if (t.ID == touchpad_id) {
++				touchpad_id = (size_t)-1;
++				touchpad_rest = v2f(0, 0);
++			}
++			if (t.ID == touch_button_id) {
++				// Fire when the finger is lifted inside the same button
++				const int btn = ui.pressed_button;
++				touch_button_id = (size_t)-1;
++				ui.pressed_button = RgdsUi::BTN_NONE;
++				if (btn != RgdsUi::BTN_NONE && ui.buttonAt(pos) == btn) {
++					static const GameKeyType keys[RgdsUi::BTN_COUNT] = {
++						KeyType::INVENTORY, KeyType::CAMERA_MODE, KeyType::ESC,
++					};
++					setKeyDown(keys[btn], {1.0f, true});
++					setKeyDown(keys[btn], {0.0f, false});
++				}
++			}
++		}
++		return true;
++	}
++
+ 	// Remember whether each key is down or up
+ 	if (g_touchcontrols && event.EventType == EET_TOUCH_INPUT_EVENT) {
+ 		// In case of touchcontrols, we have to handle different events
+diff --git a/src/client/inputhandler.h b/src/client/inputhandler.h
+index e3972f9..da433fd 100644
+--- a/src/client/inputhandler.h
++++ b/src/client/inputhandler.h
+@@ -184,6 +184,12 @@ class MyEventReceiver : public IEventReceiver
+ 
+ 	// Relative mouse movement accumulated from mouse events
+ 	v2s32 mouse_movement;
++
++	// [RG DS Plus] bottom-screen touchpad
++	size_t touchpad_id = (size_t)-1;
++	size_t touch_button_id = (size_t)-1;
++	v2s32 touchpad_last;
++	v2f touchpad_rest;
+ };
+ 
+ class InputHandler
+diff --git a/src/client/render/plain.cpp b/src/client/render/plain.cpp
+index 961f900..d904809 100644
+--- a/src/client/render/plain.cpp
++++ b/src/client/render/plain.cpp
+@@ -55,7 +55,9 @@ void DrawHUD::run(PipelineContext &context)
+ 		context.client->getCamera()->drawNametags();
+ 	}
+ 
+-	context.device->getGUIEnvironment()->drawAll();
++	// [RG DS Plus] with two screens the GUI is drawn on the bottom one
++	if (!context.device->hasSecondScreen())
++		context.device->getGUIEnvironment()->drawAll();
+ }
+ 
+ 
+diff --git a/src/client/renderingengine.cpp b/src/client/renderingengine.cpp
+index 8b5f981..78d0cda 100644
+--- a/src/client/renderingengine.cpp
++++ b/src/client/renderingengine.cpp
+@@ -4,6 +4,7 @@
+ // Copyright (C) 2017 nerzhul, Loic Blot <loic.blot@unix-experience.fr>
+ 
+ #include <optional>
++#include <unordered_map>
+ #include <irrlicht.h>
+ #include "IMeshCache.h"
+ #include "fontengine.h"
+@@ -20,6 +21,7 @@
+ #include "porting.h"
+ #include "clientmap.h"
+ #include "renderingengine.h"
++#include "rgds_ui.h"
+ #include "render/core.h"
+ #include "render/factory.h"
+ #include "filesys.h"
+@@ -298,6 +300,8 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
+ 	v2s32 textsize(g_fontengine->getTextWidth(text), g_fontengine->getLineHeight());
+ 	v2s32 center(screensize.X / 2, screensize.Y / 2);
+ 	core::rect<s32> textrect(center - textsize / 2, center + textsize / 2);
++	// [RG DS Plus] text above the progress bar, Minecraft style
++	textrect -= v2s32(0, textsize.Y * 5 / 2);
+ 
+ 	gui::IGUIStaticText *guitext =
+ 			gui::StaticText::add(guienv, text, textrect, false, false);
+@@ -307,6 +311,9 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
+ 
+ 	driver->setFog(m_menu_sky_color);
+ 	driver->beginScene(true, true, m_menu_sky_color);
++	// [RG DS Plus] Minecraft-like dirt loading background
++	rgdsTile(rgdsTexture("rgds_dirt_dark.png"),
++			core::rect<s32>(0, 0, screensize.X, screensize.Y));
+ 
+ 	if (g_settings->getBool("menu_clouds")) {
+ 		g_menuclouds->step(dtime * 3);
+@@ -382,11 +389,232 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
+ 
+ 	guienv->drawAll();
+ 	driver->endScene();
++	if (isDualScreen())
++		drawBottomScreen(BS_LOADING, 1000);
+ 	guitext->remove();
+ 	if (gui_bottom_text)
+ 		gui_bottom_text->remove();
+ }
+ 
++// ---------------------------------------------------------------------------
++// [RG DS Plus] Minecraft-style drawing helpers for the two screens
++extern "C" int rgds_touch_debug(float *nx, float *ny, int *sdl_count);
++// ---------------------------------------------------------------------------
++video::ITexture *RenderingEngine::rgdsTexture(const std::string &name)
++{
++	// Cache: the driver normalizes paths, so looking a path up again by its
++	// raw name would load (and leak) a new texture on every call.
++	static std::unordered_map<std::string, video::ITexture *> cache;
++	auto it = cache.find(name);
++	if (it != cache.end())
++		return it->second;
++	auto *driver = get_video_driver();
++	const std::string path = porting::path_share + DIR_DELIM "textures" DIR_DELIM
++			"base" DIR_DELIM "pack" DIR_DELIM + name;
++	video::ITexture *tex = fs::PathExists(path) ? driver->getTexture(path.c_str()) : nullptr;
++	if (tex) {
++		tex->grab(); // keep it alive for the whole session
++		cache[name] = tex;
++	}
++	return tex;
++}
++
++void RenderingEngine::rgdsTile(video::ITexture *tex, const core::rect<s32> &area)
++{
++	// The background image is pre-tiled at screen size: draw it as one quad.
++	if (!tex)
++		return;
++	const auto ts = tex->getOriginalSize();
++	draw2DImageFilterScaled(get_video_driver(), tex, area,
++			core::rect<s32>(0, 0, ts.Width, ts.Height), nullptr, nullptr, false);
++}
++
++void RenderingEngine::rgdsText(const std::wstring &text, const core::rect<s32> &r,
++		video::SColor color, bool hcenter, gui::IGUIFont *font)
++{
++	if (!font)
++		font = g_fontengine ? g_fontengine->getFont() : nullptr;
++	if (!font)
++		return;
++	// Minecraft-like text shadow: same text, 1/4 brightness, offset down-right
++	const s32 o = std::max<s32>(2, font->getDimension(L"M").Height / 10);
++	video::SColor sh(color.getAlpha(), color.getRed() / 4, color.getGreen() / 4, color.getBlue() / 4);
++	font->draw(text.c_str(), r + v2s32(o, o), sh, hcenter, true);
++	font->draw(text.c_str(), r, color, hcenter, true);
++}
++
++void RenderingEngine::rgdsImageFit(video::ITexture *tex, const core::rect<s32> &box)
++{
++	if (!tex)
++		return;
++	const auto ts = tex->getOriginalSize();
++	const f32 sc = std::min((f32)box.getWidth() / ts.Width, (f32)box.getHeight() / ts.Height);
++	const s32 w = ts.Width * sc, h = ts.Height * sc;
++	const v2s32 c = box.getCenter();
++	core::rect<s32> dst(c.X - w / 2, c.Y - h / 2, c.X - w / 2 + w, c.Y - h / 2 + h);
++	draw2DImageFilterScaled(get_video_driver(), tex, dst,
++			core::rect<s32>(0, 0, ts.Width, ts.Height), nullptr, nullptr, true);
++}
++
++void RenderingEngine::drawBottomScreen(BottomMode mode, u32 min_interval_ms,
++		const std::function<void()> &draw_hotbar)
++{
++	// Each bottom-screen frame switches the GL drawable, which is not free.
++	// Redraw only when the mode or the shown content changes (at most ~12x per
++	// second), or after min_interval_ms.
++	static u64 last_ms = 0;
++	static int last_mode = -1;
++	static u32 last_sig = 0;
++	const u64 now = porting::getTimeMs();
++	const u32 sig = mode == BS_GAME ? g_rgds_ui.signature : 0;
++	const bool changed = (int)mode != last_mode || (sig != last_sig && now - last_ms >= 80);
++	if (!changed && now - last_ms < min_interval_ms)
++		return;
++	last_sig = sig;
++	if ((int)mode != last_mode)
++		warningstream << "[bottom] mode " << (int)mode << std::endl;
++	if (!m_device->beginSecondScreen()) {
++		static bool warned = false;
++		if (!warned)
++			warningstream << "[bottom] beginSecondScreen failed" << std::endl;
++		warned = true;
++		return;
++	}
++	last_ms = now;
++	last_mode = (int)mode;
++
++	auto *driver = get_video_driver();
++	driver->beginScene(true, true, video::SColor(255, 20, 16, 12));
++	const v2u32 ss = driver->getScreenSize();
++	const core::rect<s32> full(0, 0, ss.X, ss.Y);
++	const s32 lh = g_fontengine ? g_fontengine->getLineHeight() : 20;
++
++	switch (mode) {
++	case BS_LOADING:
++		rgdsTile(rgdsTexture("rgds_dirt_dark.png"), full);
++		rgdsImageFit(rgdsTexture("rgds_header.png"),
++				core::rect<s32>(ss.X / 10, ss.Y / 4, ss.X * 9 / 10, ss.Y / 2));
++		rgdsText(L"Cargando el mundo...", core::rect<s32>(0, ss.Y * 6 / 10, ss.X, ss.Y * 6 / 10 + lh),
++				video::SColor(255, 255, 255, 255));
++		break;
++	case BS_MAINMENU:
++		rgdsTile(rgdsTexture("rgds_dirt_dark.png"), full);
++		break;
++	case BS_GAME_MENU:
++		rgdsTile(rgdsTexture("rgds_dirt_darker.png"), full);
++		break;
++	case BS_GAME: {
++		// 3DS-style layout: hotbar, coordinates, touchpad and buttons
++		RgdsUi &ui = g_rgds_ui;
++		ui.layout(ss);
++		rgdsTile(rgdsTexture("rgds_dirt_dark.png"), full);
++		if (draw_hotbar)
++			draw_hotbar();
++
++		// Coordinates bar
++		driver->draw2DRectangle(video::SColor(170, 0, 0, 0), ui.coords);
++		rgdsText(ui.coords_text, ui.coords, video::SColor(255, 255, 255, 255));
++
++		// Touchpad area
++		if (video::ITexture *pt = rgdsTexture("rgds_panel.png"))
++			draw2DImage9Slice(driver, pt, ui.pad, core::rect<s32>(0, 0, 48, 48),
++					core::rect<s32>(8, 8, 40, 40));
++		{
++			const v2s32 c = ui.pad.getCenter();
++			const s32 w = ui.pad.getWidth();
++			rgdsText(L"Desliza aqu\u00ed para mover la c\u00e1mara",
++					core::rect<s32>(ui.pad.UpperLeftCorner.X, c.Y - lh * 3, ui.pad.LowerRightCorner.X, c.Y - lh * 2),
++					video::SColor(255, 255, 255, 255));
++			static const wchar_t *hints[] = {
++				L"X B Y A: c\u00e1mara     Stick: caminar",
++				L"R1: picar/atacar     L1: usar/construir",
++				L"R2: saltar     L2: agacharse",
++				L"L3 (apretar stick): correr",
++				L"SELECT: inventario     START: pausa",
++			};
++			s32 y = c.Y - lh * 3 / 2;
++			for (const wchar_t *h : hints) {
++				rgdsText(h, core::rect<s32>(c.X - w / 2, y, c.X + w / 2, y + lh),
++						video::SColor(255, 170, 170, 170));
++				y += lh * 13 / 10;
++			}
++			// Touch diagnostics (small): touches seen by the game
++			float tx = -1, ty = -1;
++			int sdl_n = 0;
++			const int ev_n = rgds_touch_debug(&tx, &ty, &sdl_n);
++			wchar_t dbg[96];
++			swprintf(dbg, 96, L"toques: %d", ev_n + sdl_n);
++			rgdsText(dbg, core::rect<s32>(ui.pad.UpperLeftCorner.X, ui.pad.LowerRightCorner.Y - lh * 3 / 2,
++					ui.pad.LowerRightCorner.X, ui.pad.LowerRightCorner.Y - lh / 2),
++					video::SColor(255, 90, 110, 90));
++		}
++
++		// Buttons
++		static const wchar_t *labels[RgdsUi::BTN_COUNT] = {L"Inventario", L"C\u00e1mara", L"Pausa"};
++		static const char *icons[RgdsUi::BTN_COUNT] = {
++			"rgds_icon_inventory.png", "rgds_icon_camera.png", "rgds_icon_pause.png"};
++		for (int i = 0; i < RgdsUi::BTN_COUNT; i++) {
++			const core::rect<s32> &r = ui.button[i];
++			video::ITexture *bt = rgdsTexture(ui.pressed_button == i ?
++					"rgds_btn_pressed.png" : "rgds_btn.png");
++			if (bt) {
++				const auto ts = bt->getOriginalSize();
++				draw2DImage9Slice(driver, bt, r, core::rect<s32>(0, 0, ts.Width, ts.Height),
++						core::rect<s32>(8, 8, ts.Width - 8, ts.Height - 8));
++			} else {
++				driver->draw2DRectangle(video::SColor(255, 111, 111, 111), r);
++			}
++			const s32 ih = r.getHeight() * 55 / 100;
++			rgdsImageFit(rgdsTexture(icons[i]), core::rect<s32>(r.UpperLeftCorner.X,
++					r.UpperLeftCorner.Y + r.getHeight() / 10, r.LowerRightCorner.X,
++					r.UpperLeftCorner.Y + r.getHeight() / 10 + ih));
++			rgdsText(labels[i], core::rect<s32>(r.UpperLeftCorner.X, r.LowerRightCorner.Y - lh * 2,
++					r.LowerRightCorner.X, r.LowerRightCorner.Y - lh / 2),
++					video::SColor(255, 255, 255, 255));
++		}
++		break;
++	}
++	}
++
++	if (mode != BS_LOADING)
++		get_gui_env()->drawAll();
++	driver->endScene();
++	m_device->endSecondScreen();
++}
++
++void RenderingEngine::drawMenuTopScreen(video::ITexture *panorama, video::ITexture *header,
++		const std::wstring &splash)
++{
++	auto *driver = get_video_driver();
++	const v2u32 ss = driver->getScreenSize();
++	if (!panorama)
++		panorama = rgdsTexture("rgds_panorama.png");
++	if (!header)
++		header = rgdsTexture("rgds_header.png");
++	if (panorama) {
++		const auto ps = panorama->getOriginalSize();
++		draw2DImageFilterScaled(driver, panorama, core::rect<s32>(0, 0, ss.X, ss.Y),
++				core::rect<s32>(0, 0, ps.Width, ps.Height), nullptr, nullptr, true);
++	}
++	// Big centered logo, like the Minecraft title screen
++	const core::rect<s32> logo_box(ss.X / 14, ss.Y / 6, ss.X * 13 / 14, ss.Y / 6 + ss.Y / 4);
++	rgdsImageFit(header, logo_box);
++	// Yellow splash text
++	if (g_fontengine && !splash.empty()) {
++		gui::IGUIFont *big = g_fontengine->getFont(g_fontengine->getDefaultFontSize() * 13 / 10);
++		const s32 y = logo_box.LowerRightCorner.Y + 6;
++		rgdsText(splash, core::rect<s32>(ss.X / 3, y, ss.X, y + ss.Y / 10),
++				video::SColor(255, 255, 255, 0), true, big);
++	}
++	const s32 lh = g_fontengine ? g_fontengine->getLineHeight() : 20;
++	rgdsText(L"Toca la pantalla de abajo para jugar",
++			core::rect<s32>(0, ss.Y * 7 / 10, ss.X, ss.Y * 7 / 10 + lh),
++			video::SColor(255, 255, 255, 255));
++	rgdsText(L"Luanti 5.18  ·  Mineclonia 0.124",
++			core::rect<s32>(10, ss.Y - lh - 8, ss.X, ss.Y - 8),
++			video::SColor(255, 255, 255, 255), false);
++}
++
+ std::vector<video::E_DRIVER_TYPE> RenderingEngine::getSupportedVideoDrivers()
+ {
+ 	// Only check these drivers. We do not support software and D3D in any capacity.
+diff --git a/src/client/renderingengine.h b/src/client/renderingengine.h
+index cd3b920..a0ab6f5 100644
+--- a/src/client/renderingengine.h
++++ b/src/client/renderingengine.h
+@@ -16,6 +16,8 @@
+ // include the shadow mapper classes too
+ #include "client/shadows/dynamicshadowsrender.h"
+ #include <IVideoDriver.h>
++#include <functional>
++#include <IGUIFont.h>
+ 
+ #if !IS_CLIENT_BUILD
+ #error Do not include in server builds
+@@ -131,6 +133,25 @@ class RenderingEngine
+ 	void draw_scene(video::SColor skycolor, bool show_hud,
+ 			bool draw_wield_tool, bool draw_crosshair);
+ 
++	// [RG DS Plus] dual screen helpers
++	static bool isDualScreen()
++	{
++		return s_singleton && s_singleton->m_device &&
++				s_singleton->m_device->hasSecondScreen();
++	}
++	enum BottomMode { BS_LOADING, BS_MAINMENU, BS_GAME, BS_GAME_MENU };
++	// Draws the bottom screen (background + GUI environment) in Minecraft style.
++	void drawBottomScreen(BottomMode mode, u32 min_interval_ms = 0,
++			const std::function<void()> &draw_hotbar = nullptr);
++	// Title-screen style top screen for the main menu (dual screen only).
++	void drawMenuTopScreen(video::ITexture *panorama, video::ITexture *header,
++			const std::wstring &splash);
++	video::ITexture *rgdsTexture(const std::string &name);
++	void rgdsTile(video::ITexture *tex, const core::rect<s32> &area);
++	void rgdsText(const std::wstring &text, const core::rect<s32> &r,
++			video::SColor color, bool hcenter = true, gui::IGUIFont *font = nullptr);
++	void rgdsImageFit(video::ITexture *tex, const core::rect<s32> &box);
++
+ 	void initialize(Client *client, Hud *hud);
+ 	void finalize();
+ 
+diff --git a/src/client/rgds_ui.h b/src/client/rgds_ui.h
+new file mode 100644
+index 0000000..cb828c7
+--- /dev/null
++++ b/src/client/rgds_ui.h
+@@ -0,0 +1,64 @@
++// [RG DS Plus] Shared state of the bottom-screen game UI (3DS-style layout):
++// hotbar on top, coordinates, a touchpad area for the camera and three buttons.
++#pragma once
++#include "irrlichttypes_bloated.h"
++#include <rect.h>
++#include <string>
++
++struct RgdsUi
++{
++	static constexpr int SLOTS = 9;
++	enum Button { BTN_NONE = -1, BTN_INVENTORY = 0, BTN_CAMERA, BTN_PAUSE, BTN_COUNT };
++
++	core::rect<s32> hotbar;          // whole hotbar strip
++	core::rect<s32> slot[SLOTS];     // touch + draw rect of each slot
++	core::rect<s32> coords;          // coordinates bar
++	core::rect<s32> pad;             // touchpad (camera) area
++	core::rect<s32> button[BTN_COUNT];
++
++	// Written by the input handler, consumed by the game
++	int pending_slot = -1;
++	int pressed_button = BTN_NONE;   // button currently held by a finger
++
++	// Written by the game, read by the renderer
++	std::wstring coords_text;
++	u32 signature = 0;               // changes whenever the bottom screen must be redrawn
++
++	void layout(const v2u32 &ss)
++	{
++		const s32 m = ss.X / 128;                       // margin (8 px at 1024)
++		const s32 sw = (ss.X - 2 * m) / SLOTS;          // slot width
++		hotbar = core::rect<s32>(m, m, m + sw * SLOTS, m + sw);
++		for (int i = 0; i < SLOTS; i++)
++			slot[i] = core::rect<s32>(m + i * sw, m, m + (i + 1) * sw, m + sw);
++		const s32 cy = hotbar.LowerRightCorner.Y + m;
++		const s32 ch = ss.Y / 16;
++		coords = core::rect<s32>(m, cy, ss.X - m, cy + ch);
++		const s32 top = cy + ch + m;
++		const s32 bw = ss.X * 22 / 100;                 // buttons column
++		pad = core::rect<s32>(m, top, ss.X - bw - 2 * m, ss.Y - m);
++		const s32 bh = (ss.Y - m - top - 2 * m) / BTN_COUNT;
++		for (int i = 0; i < BTN_COUNT; i++) {
++			const s32 y = top + i * (bh + m);
++			button[i] = core::rect<s32>(ss.X - bw - m, y, ss.X - m, y + bh);
++		}
++	}
++
++	int slotAt(const v2s32 &p) const
++	{
++		for (int i = 0; i < SLOTS; i++)
++			if (slot[i].isPointInside(p))
++				return i;
++		return -1;
++	}
++
++	int buttonAt(const v2s32 &p) const
++	{
++		for (int i = 0; i < BTN_COUNT; i++)
++			if (button[i].isPointInside(p))
++				return i;
++		return BTN_NONE;
++	}
++};
++
++extern RgdsUi g_rgds_ui;
+diff --git a/src/defaultsettings.cpp b/src/defaultsettings.cpp
+index d0e0562..79fbc2d 100644
+--- a/src/defaultsettings.cpp
++++ b/src/defaultsettings.cpp
+@@ -384,6 +384,7 @@ void set_default_settings()
+ 	settings->setDefault("continuous_forward", "false");
+ 	settings->setDefault("repeat_joystick_button_time", "0.17");
+ 	settings->setDefault("joystick_frustum_sensitivity", "170");
++	settings->setDefault("touchpad_camera_sensitivity", "1.5");
+ 	settings->setDefault("joystick_inner_deadzone", "0.25");
+ 	settings->setDefault("joystick_outer_deadzone", "0");
+ 
+diff --git a/src/gui/guiEngine.cpp b/src/gui/guiEngine.cpp
+index a2c3a6f..77ef833 100644
+--- a/src/gui/guiEngine.cpp
++++ b/src/gui/guiEngine.cpp
+@@ -359,6 +359,30 @@ void GUIEngine::run()
+ 			driver->setFog(m_rendering_engine->m_menu_sky_color);
+ 			driver->beginScene(true, true, m_rendering_engine->m_menu_sky_color);
+ 
++			// [RG DS Plus] title screen on top, menu on the bottom (touch) screen
++			if (RenderingEngine::isDualScreen()) {
++				static const wchar_t *splashes[] = {
++					L"\u00a1Edici\u00f3n RG DS Plus!", L"\u00a1Doble pantalla!",
++					L"\u00a1Hecho en Per\u00fa!", L"\u00a1Ahora con touchpad!",
++					L"\u00a1100% bloques!", L"\u00a1Tambi\u00e9n prueba Terraria!",
++					L"\u00a1Cuidado con los creepers!", L"\u00a1Inventario abajo!",
++				};
++				static const std::wstring splash =
++						splashes[porting::getTimeMs() % (sizeof(splashes) / sizeof(splashes[0]))];
++				if (m_irr_toplefttext)
++					m_irr_toplefttext->setVisible(false);
++				m_rendering_engine->drawMenuTopScreen(m_textures[TEX_LAYER_OVERLAY].texture,
++						m_textures[TEX_LAYER_HEADER].texture, splash);
++				if (m_status_text)
++					m_status_text->update(dtime);
++				driver->endScene();
++				m_rendering_engine->drawBottomScreen(RenderingEngine::BS_MAINMENU, 50);
++				m_script->step();
++				sound_volume_control(m_sound_manager.get(), device->isWindowActive());
++				m_sound_manager->step(dtime);
++				continue;
++			}
++
+ 			if (m_clouds_enabled) {
+ 				drawClouds(dtime);
+ 				drawOverlay(driver);
+@@ -368,6 +392,7 @@ void GUIEngine::run()
+ 
+ 			drawFooter(driver);
+ 
++			// [RG DS Plus] the menu itself goes to the (touch) bottom screen
+ 			m_rendering_engine->get_gui_env()->drawAll();
+ 
+ 			// The header *must* be drawn after the menu because it uses
+diff --git a/src/gui/guiFormSpecMenu.cpp b/src/gui/guiFormSpecMenu.cpp
+index 2553746..e944a3b 100644
+--- a/src/gui/guiFormSpecMenu.cpp
++++ b/src/gui/guiFormSpecMenu.cpp
+@@ -4410,8 +4410,106 @@ bool GUIFormSpecMenu::remapClickOutside(const SEvent &event)
+ 	return GUIModalMenu::remapClickOutside(event);
+ }
+ 
++// [RG DS Plus] Gamepad navigation for every formspec (main menu, inventory,
++// pause menu...): D-pad/stick move the focus, A accepts, B goes back,
++// L1/R1 switch tabs. In the game itself the same buttons control the camera.
++static void rgds_send_key(EKEY_CODE key, bool down, bool shift = false, bool ctrl = false)
++{
++	SEvent ev{};
++	ev.EventType = EET_KEY_INPUT_EVENT;
++	ev.KeyInput.Key = key;
++	ev.KeyInput.Char = key == KEY_SPACE ? L' ' : 0;
++	ev.KeyInput.SystemKeyCode = 0;
++	ev.KeyInput.PressedDown = down;
++	ev.KeyInput.Shift = shift;
++	ev.KeyInput.Control = ctrl;
++	if (auto *dev = RenderingEngine::get_raw_device())
++		dev->postEventFromUser(ev);
++}
++
++bool GUIFormSpecMenu::rgdsGamepad(const SEvent &event)
++{
++	enum Nav { NONE, UP, DOWN, LEFT, RIGHT };
++	Nav nav = NONE;
++	if (event.EventType == EET_GAMEPAD_AXIS_EVENT) {
++		// Stick works like the D-pad (edge triggered)
++		static int last_x = 0, last_y = 0;
++		const auto &a = event.GamepadAxisEvent;
++		const int v = a.Value > 20000 ? 1 : (a.Value < -20000 ? -1 : 0);
++		if (a.Axis == GamepadAxis::LEFTX) {
++			if (v != last_x && v != 0) nav = v > 0 ? RIGHT : LEFT;
++			last_x = v;
++		} else if (a.Axis == GamepadAxis::LEFTY) {
++			if (v != last_y && v != 0) nav = v > 0 ? DOWN : UP;
++			last_y = v;
++		} else {
++			return false;
++		}
++		if (nav == NONE)
++			return true;
++	} else if (event.EventType == EET_GAMEPAD_BUTTON_EVENT) {
++		const auto &b = event.GamepadButtonEvent;
++		switch (b.Button) {
++		case GamepadButton::DPAD_UP: nav = UP; break;
++		case GamepadButton::DPAD_DOWN: nav = DOWN; break;
++		case GamepadButton::DPAD_LEFT: nav = LEFT; break;
++		case GamepadButton::DPAD_RIGHT: nav = RIGHT; break;
++		case GamepadButton::EAST: { // A: accept / press
++			gui::IGUIElement *f = Environment->getFocus();
++			const bool text = f && (f->getType() == gui::EGUIET_EDIT_BOX ||
++					f->getType() == gui::EGUIET_TABLE);
++			rgds_send_key(text ? KEY_RETURN : KEY_SPACE, b.PressedDown);
++			return true;
++		}
++		case GamepadButton::SOUTH: // B: back
++			if (b.PressedDown) {
++				rgds_send_key(KEY_ESCAPE, true);
++				rgds_send_key(KEY_ESCAPE, false);
++			}
++			return true;
++		case GamepadButton::LEFT_SHOULDER:
++		case GamepadButton::RIGHT_SHOULDER:
++			if (b.PressedDown) {
++				const bool prev = b.Button == GamepadButton::LEFT_SHOULDER;
++				rgds_send_key(KEY_TAB, true, prev, true);
++				rgds_send_key(KEY_TAB, false, prev, true);
++			}
++			return true;
++		case GamepadButton::NORTH:
++		case GamepadButton::WEST:
++			return true; // unused in menus
++		default:
++			return false; // START / SELECT keep their normal meaning
++		}
++		if (!b.PressedDown)
++			return true;
++	} else {
++		return false;
++	}
++
++	// Up/Down move inside lists and dropdowns, otherwise they move the focus
++	gui::IGUIElement *f = Environment->getFocus();
++	const bool listy = f && isMyDescendant(f) &&
++			(f->getType() == gui::EGUIET_TABLE || f->getType() == gui::EGUIET_LIST_BOX ||
++			f->getType() == gui::EGUIET_COMBO_BOX);
++	if ((nav == UP || nav == DOWN) && listy) {
++		const EKEY_CODE k = nav == UP ? KEY_UP : KEY_DOWN;
++		rgds_send_key(k, true);
++		rgds_send_key(k, false);
++	} else {
++		const bool back = nav == UP || nav == LEFT;
++		rgds_send_key(KEY_TAB, true, back);
++		rgds_send_key(KEY_TAB, false, back);
++	}
++	return true;
++}
++
+ bool GUIFormSpecMenu::preprocessEvent(const SEvent& event)
+ {
++
++	if (rgdsGamepad(event))
++		return true;
++
+ 	// This must be done first so that GUIModalMenu can set m_pointer_type
+ 	// correctly.
+ 	if (GUIModalMenu::preprocessEvent(event))
+@@ -4513,6 +4611,7 @@ bool GUIFormSpecMenu::preprocessEvent(const SEvent& event)
+ 
+ void GUIFormSpecMenu::tryClose()
+ {
++	warningstream << "[menu] tryClose" << std::endl;
+ 	if (m_allowclose) {
+ 		doPause = false;
+ 		acceptInput(quit_mode_cancel);
+@@ -4612,7 +4711,10 @@ bool GUIFormSpecMenu::OnEvent(const SEvent& event)
+ 		}
+ 
+ 	}
+-	if (auto kpe = KeyPressEvent(event); kpe && kpe.isPressed() && keySettingHasMatch("keymap_pause", kpe.key)) {
++	if (auto kpe = KeyPressEvent(event); kpe && kpe.isPressed() &&
++			(keySettingHasMatch("keymap_pause", kpe.key) ||
++			(m_client && kpe.key.getType() != KeyPress::InputType::KEYBOARD &&
++			keySettingHasMatch("keymap_inventory", kpe.key)))) {
+ 		tryClose();
+ 		return true;
+ 	}
+diff --git a/src/gui/guiFormSpecMenu.h b/src/gui/guiFormSpecMenu.h
+index c32ee98..53297ce 100644
+--- a/src/gui/guiFormSpecMenu.h
++++ b/src/gui/guiFormSpecMenu.h
+@@ -300,6 +300,7 @@ class GUIFormSpecMenu : public GUIModalMenu
+ 
+ 	void acceptInput(FormspecQuitMode quitmode=quit_mode_no);
+ 	bool preprocessEvent(const SEvent& event) override;
++	bool rgdsGamepad(const SEvent &event);
+ 	bool OnEvent(const SEvent& event) override;
+ 
+ 	bool doPause = false;
+diff --git a/src/gui/modalMenu.cpp b/src/gui/modalMenu.cpp
+index 0692a26..fff31a9 100644
+--- a/src/gui/modalMenu.cpp
++++ b/src/gui/modalMenu.cpp
+@@ -87,6 +87,7 @@ void GUIModalMenu::draw()
+ */
+ void GUIModalMenu::quitMenu()
+ {
++	warningstream << "[menu] quitMenu" << std::endl;
+ 	allowFocusRemoval(true);
+ 	m_menumgr->deletingMenu(this);
+ 	this->remove();
+diff --git a/src/util/string.cpp b/src/util/string.cpp
+index 11a180a..6bc1913 100644
+--- a/src/util/string.cpp
++++ b/src/util/string.cpp
+@@ -50,7 +50,7 @@ namespace {
+ 	const iconv_t IconvSmartPointer::null_value = (iconv_t) -1;
+ }
+ 
+-static bool convert(iconv_t cd, char *outbuf, size_t *outbuf_size,
++[[maybe_unused]] static bool convert(iconv_t cd, char *outbuf, size_t *outbuf_size,
+ 	char *inbuf, size_t inbuf_size)
+ {
+ 	// reset conversion state
+@@ -84,58 +84,62 @@ constexpr auto DEFAULT_ENCODING = ([] () -> const char* {
+ 	}
+ })();
+ 
++// [RG DS Plus] Own UTF-8 <-> UTF-32 conversion. The stock firmware ships glibc
++// without gconv modules, so iconv_open("UTF-32LE", ...) fails there.
+ std::wstring utf8_to_wide(std::string_view input)
+ {
+-	thread_local IconvSmartPointer cd;
+-	if (!cd)
+-		cd.reset(iconv_open(DEFAULT_ENCODING, "UTF-8"));
+-
+-	const size_t inbuf_size = input.length();
+-	// maximum possible size, every character is sizeof(wchar_t) bytes
+-	size_t outbuf_size = input.length() * sizeof(wchar_t);
+-
+-	char *inbuf = new char[inbuf_size]; // intentionally NOT null-terminated
+-	memcpy(inbuf, input.data(), inbuf_size);
++	static_assert(sizeof(wchar_t) == 4, "expects 32-bit wchar_t");
+ 	std::wstring out;
+-	out.resize(outbuf_size / sizeof(wchar_t));
+-
+-	char *outbuf = reinterpret_cast<char*>(&out[0]);
+-	if (!convert(cd.get(), outbuf, &outbuf_size, inbuf, inbuf_size)) {
+-		infostream << "Couldn't convert UTF-8 string 0x" << hex_encode(input)
+-			<< " into wstring" << std::endl;
+-		delete[] inbuf;
+-		return L"<invalid UTF-8 string>";
++	out.reserve(input.size());
++	const auto *p = reinterpret_cast<const unsigned char *>(input.data());
++	const size_t n = input.size();
++	size_t i = 0;
++	while (i < n) {
++		unsigned char c = p[i];
++		u32 cp;
++		size_t len;
++		if (c < 0x80) { cp = c; len = 1; }
++		else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
++		else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
++		else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
++		else { out.push_back(0xFFFD); i++; continue; }
++		if (i + len > n) { out.push_back(0xFFFD); break; }
++		bool ok = true;
++		for (size_t k = 1; k < len; k++) {
++			if ((p[i + k] & 0xC0) != 0x80) { ok = false; break; }
++			cp = (cp << 6) | (p[i + k] & 0x3F);
++		}
++		if (!ok) { out.push_back(0xFFFD); i++; continue; }
++		out.push_back((wchar_t)cp);
++		i += len;
+ 	}
+-	delete[] inbuf;
+-
+-	out.resize(outbuf_size / sizeof(wchar_t));
+ 	return out;
+ }
+ 
+ std::string wide_to_utf8(std::wstring_view input)
+ {
+-	thread_local IconvSmartPointer cd;
+-	if (!cd)
+-		cd.reset(iconv_open("UTF-8", DEFAULT_ENCODING));
+-
+-	const size_t inbuf_size = input.length() * sizeof(wchar_t);
+-	// maximum possible size: utf-8 encodes codepoints using 1 up to 4 bytes
+-	size_t outbuf_size = input.length() * 4;
+-
+-	char *inbuf = new char[inbuf_size]; // intentionally NOT null-terminated
+-	memcpy(inbuf, input.data(), inbuf_size);
+ 	std::string out;
+-	out.resize(outbuf_size);
+-
+-	if (!convert(cd.get(), &out[0], &outbuf_size, inbuf, inbuf_size)) {
+-		infostream << "Couldn't convert wstring 0x" << hex_encode(inbuf, inbuf_size)
+-			<< " into UTF-8 string" << std::endl;
+-		delete[] inbuf;
+-		return "<invalid wide string>";
++	out.reserve(input.size());
++	for (wchar_t wc : input) {
++		u32 cp = (u32)wc;
++		if (cp < 0x80) {
++			out.push_back((char)cp);
++		} else if (cp < 0x800) {
++			out.push_back((char)(0xC0 | (cp >> 6)));
++			out.push_back((char)(0x80 | (cp & 0x3F)));
++		} else if (cp < 0x10000) {
++			out.push_back((char)(0xE0 | (cp >> 12)));
++			out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
++			out.push_back((char)(0x80 | (cp & 0x3F)));
++		} else if (cp < 0x110000) {
++			out.push_back((char)(0xF0 | (cp >> 18)));
++			out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
++			out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
++			out.push_back((char)(0x80 | (cp & 0x3F)));
++		} else {
++			out += "\xEF\xBF\xBD";
++		}
+ 	}
+-	delete[] inbuf;
+-
+-	out.resize(outbuf_size);
+ 	return out;
+ }
+ 
