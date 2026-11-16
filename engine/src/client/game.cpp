@@ -3752,8 +3752,11 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 			}
 			infostream << "[mem] rss=" << rss * 4 / 1024 << " MB" << std::endl;
 #ifdef __GLIBC__
-			// Hand freed heap pages back to the system (matters with 1 GB of RAM)
-			malloc_trim(0);
+			// Hand freed heap pages back to the system (matters with 1 GB of RAM).
+			// Only every 30 s: trimming takes a few ms and would be felt as a hitch.
+			static int trim_count = 0;
+			if (++trim_count % 3 == 0)
+				malloc_trim(0);
 #endif
 		}
 	}
@@ -3771,8 +3774,6 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 			ui.coords_text = buf;
 			// Signature of everything shown below: redraw only when it changes
 			u32 sig = player->getWieldIndex() * 31 + (u32)(ui.pressed_button + 2) * 7919;
-			for (wchar_t c : ui.coords_text)
-				sig = sig * 131 + c;
 			if (InventoryList *l = player->inventory.getList("main")) {
 				const u32 n = std::min<u32>(l->getSize(), RgdsUi::SLOTS);
 				for (u32 i = 0; i < n; i++) {
@@ -3787,7 +3788,7 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 		Hud *h = this->hud;
 		this->m_rendering_engine->drawBottomScreen(
 				menu ? RenderingEngine::BS_GAME_MENU : RenderingEngine::BS_GAME,
-				menu ? 60 : 500,
+				menu ? 60 : 350,
 				[h] { if (h) h->drawBottomHotbar(); });
 	}
 

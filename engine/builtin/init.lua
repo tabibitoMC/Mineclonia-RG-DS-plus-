@@ -6,8 +6,8 @@
 --
 
 -- [RG DS Plus] Collect garbage a bit earlier: lower peak Lua memory on a 1 GB console
-collectgarbage("setpause", 140)
-collectgarbage("setstepmul", 300)
+collectgarbage("setpause", 170)
+collectgarbage("setstepmul", 200)
 
 -- Initialize some very basic things
 function core.error_handler(err, level)

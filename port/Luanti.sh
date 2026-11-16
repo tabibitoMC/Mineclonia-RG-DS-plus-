@@ -31,8 +31,9 @@ fi
 
 # Mapeo del mando de la RG DS Plus por posicion fisica de los botones
 # (X arriba, B abajo, Y izquierda, A derecha; SELECT = "back", MENU = "guide").
-# El mapeo de fabrica cruza A/B, X/Y y SELECT/MENU, por eso se define aqui.
-RGDS_MAP="a:b1,b:b0,x:b2,y:b3,back:b6,guide:b8,start:b7,leftstick:b9,rightstick:b12,leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpleft:h0.8,dpdown:h0.4,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:b10,righttrigger:b11,platform:Linux,"
+# En esta consola: B=b0, A=b1, X=b2, Y=b3. SDL nombra por posicion:
+# a=abajo(B), b=derecha(A), x=izquierda(Y), y=arriba(X).
+RGDS_MAP="a:b0,b:b1,x:b3,y:b2,back:b6,guide:b8,start:b7,leftstick:b9,rightstick:b12,leftshoulder:b4,rightshoulder:b5,dpup:h0.1,dpleft:h0.8,dpdown:h0.4,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:b10,righttrigger:b11,platform:Linux,"
 unset SDL_GAMECONTROLLERCONFIG_FILE
 export SDL_GAMECONTROLLERCONFIG="1900b655010000000100000000010000,ANBERNIC-rk3568-keys,$RGDS_MAP
 19000000010000000100000000010000,ANBERNIC-rk3568-keys,$RGDS_MAP"
@@ -97,7 +98,7 @@ echo "--- memoria con swap"  >> "$LOG"; free -m >> "$LOG" 2>&1
 
 # Memoria: menos fragmentacion y devolver al sistema lo que se libera
 export MALLOC_ARENA_MAX=2
-export MALLOC_TRIM_THRESHOLD_=131072
+export MALLOC_TRIM_THRESHOLD_=4194304
 export MALLOC_MMAP_THRESHOLD_=131072
 
 echo "--- arrancando" >> "$LOG"
