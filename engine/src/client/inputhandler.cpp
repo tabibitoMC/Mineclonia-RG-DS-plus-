@@ -202,6 +202,7 @@ std::pair<float, bool> MyEventReceiver::checkKeyDown(GameKeyType action) const
 }
 
 RgdsUi g_rgds_ui;
+RgdsKbd g_rgds_kbd;
 
 bool MyEventReceiver::OnEvent(const SEvent &event)
 {

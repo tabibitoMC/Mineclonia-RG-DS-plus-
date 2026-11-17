@@ -3,6 +3,7 @@
 // Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
 // Copyright (C) 2017 nerzhul, Loic Blot <loic.blot@unix-experience.fr>
 
+#include <IGUIEditBox.h>
 #include <optional>
 #include <unordered_map>
 #include <irrlicht.h>
@@ -578,6 +579,50 @@ void RenderingEngine::drawBottomScreen(BottomMode mode, u32 min_interval_ms,
 
 	if (mode != BS_LOADING)
 		get_gui_env()->drawAll();
+
+	// On-screen keyboard while a text field has the focus
+	if (mode == BS_MAINMENU || mode == BS_GAME_MENU) {
+		RgdsKbd &kb = g_rgds_kbd;
+		gui::IGUIElement *f = get_gui_env()->getFocus();
+		// Only real input fields: read-only text boxes (credits, logs) don't count
+		const bool edit = f && f->getType() == gui::EGUIET_EDIT_BOX &&
+				static_cast<gui::IGUIEditBox *>(f)->isWritable();
+		if (!edit)
+			kb.dismissed_for = nullptr;
+		kb.visible = edit && kb.dismissed_for != f;
+		if (kb.visible) {
+			kb.layout(ss);
+			driver->draw2DRectangle(video::SColor(245, 24, 24, 28), kb.area);
+			driver->draw2DRectangle(video::SColor(255, 0, 0, 0), kb.preview);
+			std::wstring txt = f->getText();
+			if (static_cast<gui::IGUIEditBox *>(f)->isPasswordBox())
+				txt.assign(txt.size(), L'*');
+			rgdsText(txt + L"_", kb.preview, video::SColor(255, 255, 255, 255));
+			video::ITexture *bt = rgdsTexture("rgds_btn.png");
+			auto draw_key = [&](const core::rect<s32> &r0, const std::wstring &label, bool lit) {
+				core::rect<s32> r(r0.UpperLeftCorner + v2s32(2, 2), r0.LowerRightCorner - v2s32(2, 2));
+				if (bt) {
+					const auto ts = bt->getOriginalSize();
+					draw2DImage9Slice(driver, bt, r, core::rect<s32>(0, 0, ts.Width, ts.Height),
+							core::rect<s32>(8, 8, ts.Width - 8, ts.Height - 8));
+				} else {
+					driver->draw2DRectangle(video::SColor(255, 111, 111, 111), r);
+				}
+				rgdsText(label, r, lit ? video::SColor(255, 255, 255, 85) : video::SColor(255, 255, 255, 255));
+			};
+			for (int r = 0; r < RgdsKbd::ROWS; r++) {
+				const wchar_t *chars = RgdsKbd::row(r, kb.shift);
+				for (int c = 0; c < RgdsKbd::COLS; c++)
+					draw_key(kb.key[r][c], std::wstring(1, chars[c]), false);
+			}
+			draw_key(kb.special[RgdsKbd::SP_SHIFT], L"MAY\u00daS", kb.shift);
+			draw_key(kb.special[RgdsKbd::SP_SPACE], L"Espacio", false);
+			draw_key(kb.special[RgdsKbd::SP_BACK], L"Borrar", false);
+			draw_key(kb.special[RgdsKbd::SP_OK], L"Listo", false);
+		}
+	} else {
+		g_rgds_kbd.visible = false;
+	}
 	driver->endScene();
 	m_device->endSecondScreen();
 }

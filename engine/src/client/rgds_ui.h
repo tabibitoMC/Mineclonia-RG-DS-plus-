@@ -62,3 +62,46 @@ struct RgdsUi
 };
 
 extern RgdsUi g_rgds_ui;
+
+// [RG DS Plus] On-screen keyboard for text fields (bottom screen, touch).
+struct RgdsKbd
+{
+	static constexpr int COLS = 10, ROWS = 4;
+	enum Special { SP_SHIFT = 0, SP_SPACE, SP_BACK, SP_OK, SP_COUNT };
+
+	bool visible = false;
+	bool shift = false;
+	const void *dismissed_for = nullptr; // field for which the user closed the keyboard
+	size_t touch_id = (size_t)-1;
+
+	core::rect<s32> area;      // whole keyboard (touches inside never reach the menu)
+	core::rect<s32> preview;   // text being edited
+	core::rect<s32> key[ROWS][COLS];
+	core::rect<s32> special[SP_COUNT];
+
+	static const wchar_t *row(int r, bool shifted)
+	{
+		static const wchar_t *lo[ROWS] = {L"1234567890", L"qwertyuiop", L"asdfghjkl-", L"zxcvbnm,._"};
+		static const wchar_t *up[ROWS] = {L"1234567890", L"QWERTYUIOP", L"ASDFGHJKL-", L"ZXCVBNM,._"};
+		return (shifted ? up : lo)[r];
+	}
+
+	void layout(const v2u32 &ss)
+	{
+		const s32 kh = ss.Y / 10;                 // key height
+		const s32 kw = ss.X / COLS;
+		const s32 top = ss.Y - kh * (ROWS + 1);
+		preview = core::rect<s32>(0, top - kh * 8 / 10, ss.X, top);
+		area = core::rect<s32>(0, preview.UpperLeftCorner.Y, ss.X, ss.Y);
+		for (int r = 0; r < ROWS; r++)
+			for (int c = 0; c < COLS; c++)
+				key[r][c] = core::rect<s32>(c * kw, top + r * kh, (c + 1) * kw, top + (r + 1) * kh);
+		const s32 y = top + ROWS * kh;
+		special[SP_SHIFT] = core::rect<s32>(0, y, kw * 2, ss.Y);
+		special[SP_SPACE] = core::rect<s32>(kw * 2, y, kw * 6, ss.Y);
+		special[SP_BACK] = core::rect<s32>(kw * 6, y, kw * 8, ss.Y);
+		special[SP_OK] = core::rect<s32>(kw * 8, y, ss.X, ss.Y);
+	}
+};
+
+extern RgdsKbd g_rgds_kbd;

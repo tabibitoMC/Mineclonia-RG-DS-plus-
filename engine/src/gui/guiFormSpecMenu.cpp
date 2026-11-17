@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (C) 2013 celeron55, Perttu Ahola <celeron55@gmail.com>
 
+#include "client/rgds_ui.h"
 #include "guiFormSpecMenu.h"
 
 #include <cstdlib>
@@ -4427,8 +4428,85 @@ static void rgds_send_key(EKEY_CODE key, bool down, bool shift = false, bool ctr
 		dev->postEventFromUser(ev);
 }
 
+// [RG DS Plus] touches on the on-screen keyboard
+static bool rgds_keyboard_touch(const SEvent &event)
+{
+	RgdsKbd &kb = g_rgds_kbd;
+	if (event.EventType != EET_TOUCH_INPUT_EVENT)
+		return false;
+	const auto &t = event.TouchInput;
+	if (t.Event != ETIE_PRESSED_DOWN) {
+		// swallow the rest of a touch that started on the keyboard
+		if (t.ID != kb.touch_id)
+			return false;
+		if (t.Event == ETIE_LEFT_UP)
+			kb.touch_id = (size_t)-1;
+		return true;
+	}
+	if (!kb.visible)
+		return false;
+	const v2s32 p(t.X, t.Y);
+	if (!kb.area.isPointInside(p))
+		return false;
+	kb.touch_id = t.ID;
+	auto *dev = RenderingEngine::get_raw_device();
+	auto type = [dev](const wchar_t *str) {
+		SEvent ev{};
+		ev.EventType = EET_STRING_INPUT_EVENT;
+		ev.StringInput.Str = new core::stringw(str);
+		dev->postEventFromUser(ev);
+		delete ev.StringInput.Str;
+	};
+	for (int r = 0; r < RgdsKbd::ROWS; r++)
+		for (int c = 0; c < RgdsKbd::COLS; c++)
+			if (kb.key[r][c].isPointInside(p)) {
+				const wchar_t s[2] = {RgdsKbd::row(r, kb.shift)[c], 0};
+				type(s);
+				kb.shift = false;
+				return true;
+			}
+	if (kb.special[RgdsKbd::SP_SHIFT].isPointInside(p)) {
+		kb.shift = !kb.shift;
+	} else if (kb.special[RgdsKbd::SP_SPACE].isPointInside(p)) {
+		type(L" ");
+	} else if (kb.special[RgdsKbd::SP_BACK].isPointInside(p)) {
+		rgds_send_key(KEY_BACK, true);
+		rgds_send_key(KEY_BACK, false);
+	} else if (kb.special[RgdsKbd::SP_OK].isPointInside(p)) {
+		kb.dismissed_for = dev->getGUIEnvironment()->getFocus();
+		kb.visible = false;
+	}
+	return true;
+}
+
 bool GUIFormSpecMenu::rgdsGamepad(const SEvent &event)
 {
+	if (rgds_keyboard_touch(event))
+		return true;
+	// With the keyboard open, A or B closes it (the text stays in the field);
+	// with it closed, A on a text field opens it again.
+	if (event.EventType == EET_GAMEPAD_BUTTON_EVENT &&
+			(event.GamepadButtonEvent.Button == GamepadButton::EAST ||
+			event.GamepadButtonEvent.Button == GamepadButton::SOUTH)) {
+		RgdsKbd &kb = g_rgds_kbd;
+		gui::IGUIElement *f = Environment->getFocus();
+		const bool edit = f && f->getType() == gui::EGUIET_EDIT_BOX &&
+				static_cast<gui::IGUIEditBox *>(f)->isWritable();
+		if (kb.visible) {
+			if (event.GamepadButtonEvent.PressedDown) {
+				kb.dismissed_for = f;
+				kb.visible = false;
+			}
+			return true;
+		}
+		if (edit && kb.dismissed_for == f &&
+				event.GamepadButtonEvent.Button == GamepadButton::EAST) {
+			if (event.GamepadButtonEvent.PressedDown)
+				kb.dismissed_for = nullptr;
+			return true;
+		}
+	}
+
 	enum Nav { NONE, UP, DOWN, LEFT, RIGHT };
 	Nav nav = NONE;
 	if (event.EventType == EET_GAMEPAD_AXIS_EVENT) {

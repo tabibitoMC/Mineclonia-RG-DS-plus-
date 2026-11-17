@@ -25,6 +25,11 @@ PANTALLAS
   El inventario, cofres, mesas y menus tambien se abren abajo y se
   manejan con el dedo o el lapiz.
 
+TECLADO
+  Al tocar un campo de texto (nombre del mundo, semilla, un numero en
+  los ajustes) aparece un teclado en la pantalla de abajo. "Listo", o
+  los botones A o B, lo cierran y el texto queda escrito.
+
 CONTROLES EN MENUS (menu principal, inventario, pausa, cofres)
   Cruceta / Stick .. moverse entre botones (arriba/abajo tambien
                      recorre listas, como la de mundos)

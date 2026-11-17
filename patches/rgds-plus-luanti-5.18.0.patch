@@ -1106,7 +1106,7 @@ index 9e52c3c..f9e70be 100644
  	void drawCrosshair();
  	void drawSelectionMesh();
 diff --git a/src/client/inputhandler.cpp b/src/client/inputhandler.cpp
-index 0f86e1e..f251a76 100644
+index 0f86e1e..e2e177b 100644
 --- a/src/client/inputhandler.cpp
 +++ b/src/client/inputhandler.cpp
 @@ -7,6 +7,7 @@
@@ -1117,16 +1117,17 @@ index 0f86e1e..f251a76 100644
  #include "gui/mainmenumanager.h"
  #include "gui/touchcontrols.h"
  #include "hud_element.h"
-@@ -200,6 +201,8 @@ std::pair<float, bool> MyEventReceiver::checkKeyDown(GameKeyType action) const
+@@ -200,6 +201,9 @@ std::pair<float, bool> MyEventReceiver::checkKeyDown(GameKeyType action) const
  	return std::pair(value, setWasKeyDown);
  }
  
 +RgdsUi g_rgds_ui;
++RgdsKbd g_rgds_kbd;
 +
  bool MyEventReceiver::OnEvent(const SEvent &event)
  {
  	if (event.EventType == EET_LOG_TEXT_EVENT) {
-@@ -268,6 +271,66 @@ bool MyEventReceiver::OnEvent(const SEvent &event)
+@@ -268,6 +272,66 @@ bool MyEventReceiver::OnEvent(const SEvent &event)
  		return ret;
  	}
  
@@ -1226,18 +1227,20 @@ index 961f900..d904809 100644
  
  
 diff --git a/src/client/renderingengine.cpp b/src/client/renderingengine.cpp
-index 8b5f981..78d0cda 100644
+index 8b5f981..c4f66c1 100644
 --- a/src/client/renderingengine.cpp
 +++ b/src/client/renderingengine.cpp
-@@ -4,6 +4,7 @@
+@@ -3,7 +3,9 @@
+ // Copyright (C) 2010-2013 celeron55, Perttu Ahola <celeron55@gmail.com>
  // Copyright (C) 2017 nerzhul, Loic Blot <loic.blot@unix-experience.fr>
  
++#include <IGUIEditBox.h>
  #include <optional>
 +#include <unordered_map>
  #include <irrlicht.h>
  #include "IMeshCache.h"
  #include "fontengine.h"
-@@ -20,6 +21,7 @@
+@@ -20,6 +22,7 @@
  #include "porting.h"
  #include "clientmap.h"
  #include "renderingengine.h"
@@ -1245,7 +1248,7 @@ index 8b5f981..78d0cda 100644
  #include "render/core.h"
  #include "render/factory.h"
  #include "filesys.h"
-@@ -298,6 +300,8 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
+@@ -298,6 +301,8 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
  	v2s32 textsize(g_fontengine->getTextWidth(text), g_fontengine->getLineHeight());
  	v2s32 center(screensize.X / 2, screensize.Y / 2);
  	core::rect<s32> textrect(center - textsize / 2, center + textsize / 2);
@@ -1254,7 +1257,7 @@ index 8b5f981..78d0cda 100644
  
  	gui::IGUIStaticText *guitext =
  			gui::StaticText::add(guienv, text, textrect, false, false);
-@@ -307,6 +311,9 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
+@@ -307,6 +312,9 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
  
  	driver->setFog(m_menu_sky_color);
  	driver->beginScene(true, true, m_menu_sky_color);
@@ -1264,7 +1267,7 @@ index 8b5f981..78d0cda 100644
  
  	if (g_settings->getBool("menu_clouds")) {
  		g_menuclouds->step(dtime * 3);
-@@ -382,11 +389,232 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
+@@ -382,11 +390,276 @@ void RenderingEngine::draw_load_screen(const std::wstring &text,
  
  	guienv->drawAll();
  	driver->endScene();
@@ -1457,6 +1460,50 @@ index 8b5f981..78d0cda 100644
 +
 +	if (mode != BS_LOADING)
 +		get_gui_env()->drawAll();
++
++	// On-screen keyboard while a text field has the focus
++	if (mode == BS_MAINMENU || mode == BS_GAME_MENU) {
++		RgdsKbd &kb = g_rgds_kbd;
++		gui::IGUIElement *f = get_gui_env()->getFocus();
++		// Only real input fields: read-only text boxes (credits, logs) don't count
++		const bool edit = f && f->getType() == gui::EGUIET_EDIT_BOX &&
++				static_cast<gui::IGUIEditBox *>(f)->isWritable();
++		if (!edit)
++			kb.dismissed_for = nullptr;
++		kb.visible = edit && kb.dismissed_for != f;
++		if (kb.visible) {
++			kb.layout(ss);
++			driver->draw2DRectangle(video::SColor(245, 24, 24, 28), kb.area);
++			driver->draw2DRectangle(video::SColor(255, 0, 0, 0), kb.preview);
++			std::wstring txt = f->getText();
++			if (static_cast<gui::IGUIEditBox *>(f)->isPasswordBox())
++				txt.assign(txt.size(), L'*');
++			rgdsText(txt + L"_", kb.preview, video::SColor(255, 255, 255, 255));
++			video::ITexture *bt = rgdsTexture("rgds_btn.png");
++			auto draw_key = [&](const core::rect<s32> &r0, const std::wstring &label, bool lit) {
++				core::rect<s32> r(r0.UpperLeftCorner + v2s32(2, 2), r0.LowerRightCorner - v2s32(2, 2));
++				if (bt) {
++					const auto ts = bt->getOriginalSize();
++					draw2DImage9Slice(driver, bt, r, core::rect<s32>(0, 0, ts.Width, ts.Height),
++							core::rect<s32>(8, 8, ts.Width - 8, ts.Height - 8));
++				} else {
++					driver->draw2DRectangle(video::SColor(255, 111, 111, 111), r);
++				}
++				rgdsText(label, r, lit ? video::SColor(255, 255, 255, 85) : video::SColor(255, 255, 255, 255));
++			};
++			for (int r = 0; r < RgdsKbd::ROWS; r++) {
++				const wchar_t *chars = RgdsKbd::row(r, kb.shift);
++				for (int c = 0; c < RgdsKbd::COLS; c++)
++					draw_key(kb.key[r][c], std::wstring(1, chars[c]), false);
++			}
++			draw_key(kb.special[RgdsKbd::SP_SHIFT], L"MAY\u00daS", kb.shift);
++			draw_key(kb.special[RgdsKbd::SP_SPACE], L"Espacio", false);
++			draw_key(kb.special[RgdsKbd::SP_BACK], L"Borrar", false);
++			draw_key(kb.special[RgdsKbd::SP_OK], L"Listo", false);
++		}
++	} else {
++		g_rgds_kbd.visible = false;
++	}
 +	driver->endScene();
 +	m_device->endSecondScreen();
 +}
@@ -1538,10 +1585,10 @@ index cd3b920..a0ab6f5 100644
  
 diff --git a/src/client/rgds_ui.h b/src/client/rgds_ui.h
 new file mode 100644
-index 0000000..cb828c7
+index 0000000..7d55031
 --- /dev/null
 +++ b/src/client/rgds_ui.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,107 @@
 +// [RG DS Plus] Shared state of the bottom-screen game UI (3DS-style layout):
 +// hotbar on top, coordinates, a touchpad area for the camera and three buttons.
 +#pragma once
@@ -1606,6 +1653,49 @@ index 0000000..cb828c7
 +};
 +
 +extern RgdsUi g_rgds_ui;
++
++// [RG DS Plus] On-screen keyboard for text fields (bottom screen, touch).
++struct RgdsKbd
++{
++	static constexpr int COLS = 10, ROWS = 4;
++	enum Special { SP_SHIFT = 0, SP_SPACE, SP_BACK, SP_OK, SP_COUNT };
++
++	bool visible = false;
++	bool shift = false;
++	const void *dismissed_for = nullptr; // field for which the user closed the keyboard
++	size_t touch_id = (size_t)-1;
++
++	core::rect<s32> area;      // whole keyboard (touches inside never reach the menu)
++	core::rect<s32> preview;   // text being edited
++	core::rect<s32> key[ROWS][COLS];
++	core::rect<s32> special[SP_COUNT];
++
++	static const wchar_t *row(int r, bool shifted)
++	{
++		static const wchar_t *lo[ROWS] = {L"1234567890", L"qwertyuiop", L"asdfghjkl-", L"zxcvbnm,._"};
++		static const wchar_t *up[ROWS] = {L"1234567890", L"QWERTYUIOP", L"ASDFGHJKL-", L"ZXCVBNM,._"};
++		return (shifted ? up : lo)[r];
++	}
++
++	void layout(const v2u32 &ss)
++	{
++		const s32 kh = ss.Y / 10;                 // key height
++		const s32 kw = ss.X / COLS;
++		const s32 top = ss.Y - kh * (ROWS + 1);
++		preview = core::rect<s32>(0, top - kh * 8 / 10, ss.X, top);
++		area = core::rect<s32>(0, preview.UpperLeftCorner.Y, ss.X, ss.Y);
++		for (int r = 0; r < ROWS; r++)
++			for (int c = 0; c < COLS; c++)
++				key[r][c] = core::rect<s32>(c * kw, top + r * kh, (c + 1) * kw, top + (r + 1) * kh);
++		const s32 y = top + ROWS * kh;
++		special[SP_SHIFT] = core::rect<s32>(0, y, kw * 2, ss.Y);
++		special[SP_SPACE] = core::rect<s32>(kw * 2, y, kw * 6, ss.Y);
++		special[SP_BACK] = core::rect<s32>(kw * 6, y, kw * 8, ss.Y);
++		special[SP_OK] = core::rect<s32>(kw * 8, y, ss.X, ss.Y);
++	}
++};
++
++extern RgdsKbd g_rgds_kbd;
 diff --git a/src/defaultsettings.cpp b/src/defaultsettings.cpp
 index d0e0562..79fbc2d 100644
 --- a/src/defaultsettings.cpp
@@ -1662,10 +1752,18 @@ index a2c3a6f..77ef833 100644
  
  			// The header *must* be drawn after the menu because it uses
 diff --git a/src/gui/guiFormSpecMenu.cpp b/src/gui/guiFormSpecMenu.cpp
-index 2553746..e944a3b 100644
+index 2553746..b2a4c33 100644
 --- a/src/gui/guiFormSpecMenu.cpp
 +++ b/src/gui/guiFormSpecMenu.cpp
-@@ -4410,8 +4410,106 @@ bool GUIFormSpecMenu::remapClickOutside(const SEvent &event)
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+ // Copyright (C) 2013 celeron55, Perttu Ahola <celeron55@gmail.com>
+ 
++#include "client/rgds_ui.h"
+ #include "guiFormSpecMenu.h"
+ 
+ #include <cstdlib>
+@@ -4410,8 +4411,183 @@ bool GUIFormSpecMenu::remapClickOutside(const SEvent &event)
  	return GUIModalMenu::remapClickOutside(event);
  }
  
@@ -1686,8 +1784,85 @@ index 2553746..e944a3b 100644
 +		dev->postEventFromUser(ev);
 +}
 +
++// [RG DS Plus] touches on the on-screen keyboard
++static bool rgds_keyboard_touch(const SEvent &event)
++{
++	RgdsKbd &kb = g_rgds_kbd;
++	if (event.EventType != EET_TOUCH_INPUT_EVENT)
++		return false;
++	const auto &t = event.TouchInput;
++	if (t.Event != ETIE_PRESSED_DOWN) {
++		// swallow the rest of a touch that started on the keyboard
++		if (t.ID != kb.touch_id)
++			return false;
++		if (t.Event == ETIE_LEFT_UP)
++			kb.touch_id = (size_t)-1;
++		return true;
++	}
++	if (!kb.visible)
++		return false;
++	const v2s32 p(t.X, t.Y);
++	if (!kb.area.isPointInside(p))
++		return false;
++	kb.touch_id = t.ID;
++	auto *dev = RenderingEngine::get_raw_device();
++	auto type = [dev](const wchar_t *str) {
++		SEvent ev{};
++		ev.EventType = EET_STRING_INPUT_EVENT;
++		ev.StringInput.Str = new core::stringw(str);
++		dev->postEventFromUser(ev);
++		delete ev.StringInput.Str;
++	};
++	for (int r = 0; r < RgdsKbd::ROWS; r++)
++		for (int c = 0; c < RgdsKbd::COLS; c++)
++			if (kb.key[r][c].isPointInside(p)) {
++				const wchar_t s[2] = {RgdsKbd::row(r, kb.shift)[c], 0};
++				type(s);
++				kb.shift = false;
++				return true;
++			}
++	if (kb.special[RgdsKbd::SP_SHIFT].isPointInside(p)) {
++		kb.shift = !kb.shift;
++	} else if (kb.special[RgdsKbd::SP_SPACE].isPointInside(p)) {
++		type(L" ");
++	} else if (kb.special[RgdsKbd::SP_BACK].isPointInside(p)) {
++		rgds_send_key(KEY_BACK, true);
++		rgds_send_key(KEY_BACK, false);
++	} else if (kb.special[RgdsKbd::SP_OK].isPointInside(p)) {
++		kb.dismissed_for = dev->getGUIEnvironment()->getFocus();
++		kb.visible = false;
++	}
++	return true;
++}
++
 +bool GUIFormSpecMenu::rgdsGamepad(const SEvent &event)
 +{
++	if (rgds_keyboard_touch(event))
++		return true;
++	// With the keyboard open, A or B closes it (the text stays in the field);
++	// with it closed, A on a text field opens it again.
++	if (event.EventType == EET_GAMEPAD_BUTTON_EVENT &&
++			(event.GamepadButtonEvent.Button == GamepadButton::EAST ||
++			event.GamepadButtonEvent.Button == GamepadButton::SOUTH)) {
++		RgdsKbd &kb = g_rgds_kbd;
++		gui::IGUIElement *f = Environment->getFocus();
++		const bool edit = f && f->getType() == gui::EGUIET_EDIT_BOX &&
++				static_cast<gui::IGUIEditBox *>(f)->isWritable();
++		if (kb.visible) {
++			if (event.GamepadButtonEvent.PressedDown) {
++				kb.dismissed_for = f;
++				kb.visible = false;
++			}
++			return true;
++		}
++		if (edit && kb.dismissed_for == f &&
++				event.GamepadButtonEvent.Button == GamepadButton::EAST) {
++			if (event.GamepadButtonEvent.PressedDown)
++				kb.dismissed_for = nullptr;
++			return true;
++		}
++	}
++
 +	enum Nav { NONE, UP, DOWN, LEFT, RIGHT };
 +	Nav nav = NONE;
 +	if (event.EventType == EET_GAMEPAD_AXIS_EVENT) {
@@ -1772,7 +1947,7 @@ index 2553746..e944a3b 100644
  	// This must be done first so that GUIModalMenu can set m_pointer_type
  	// correctly.
  	if (GUIModalMenu::preprocessEvent(event))
-@@ -4513,6 +4611,7 @@ bool GUIFormSpecMenu::preprocessEvent(const SEvent& event)
+@@ -4513,6 +4689,7 @@ bool GUIFormSpecMenu::preprocessEvent(const SEvent& event)
  
  void GUIFormSpecMenu::tryClose()
  {
@@ -1780,7 +1955,7 @@ index 2553746..e944a3b 100644
  	if (m_allowclose) {
  		doPause = false;
  		acceptInput(quit_mode_cancel);
-@@ -4612,7 +4711,10 @@ bool GUIFormSpecMenu::OnEvent(const SEvent& event)
+@@ -4612,7 +4789,10 @@ bool GUIFormSpecMenu::OnEvent(const SEvent& event)
  		}
  
  	}

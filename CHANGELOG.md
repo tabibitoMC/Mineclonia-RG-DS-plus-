@@ -15,6 +15,7 @@ El diff completo está en `patches/rgds-plus-luanti-5.18.0.patch`.
   ya no se dibuja arriba.
 - **Vida, comida y experiencia:** al no estar la barra de objetos arriba, estas barras
   pasan al borde superior de la pantalla de arriba.
+- **Teclado en pantalla:** al tocar un campo de texto aparece un teclado táctil abajo.
 - **Táctil:** lectura directa del panel (evdev) y activación del panel, que el menú de la
   consola apaga al abrir programas externos.
 - **Mando:** navegación de menús con cruceta/stick, A y B; L1/R1 cambian de pestaña.
